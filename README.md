@@ -163,7 +163,7 @@ fbdev, …) is yours to provide; Jet stops at the framebuffer.
 Full API reference is generated from the inline Doxygen comments in
 [`src/`](src) and is published via GitHub Pages at:
 
-> **<https://cubecoders.github.io/jet/>**
+> **<https://cubecoders.github.io/Jet/>**
 
 <!-- (GitHub Pages serves project sites at `https://<owner>.github.io/<repo>/`,
 so the URL above is the canonical location for any commit on the
