@@ -9,6 +9,8 @@ modern C++17. It is designed to run on low-performance embedded hardware with li
 
 Jet runs entirely in software using fast, integer-only arithmetic. It exclusively uses 16-bit RGB565 color natively for fast output to 565 displays such as the ST7796, ILI9488 and other similar SPI displays.
 
+On an ESP32 S3, it is capable of rendering approxiamtely 15000 triangles/second (flat shaded), or approximately 250 on-screen triangles (after culling) at 60fps at 480x320, or 500 at 30fps which puts it somewhere between the Sega 32X and Sega Saturn in terms of performance at that resolution.
+
 ## Demo
 
 A demonstration of a Wipeout-style game built on Jet, running on an
