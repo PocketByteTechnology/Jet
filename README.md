@@ -11,6 +11,10 @@ Jet runs entirely in software using fast, integer-only arithmetic. It exclusivel
 
 On an ESP32 S3, it is capable of rendering approxiamtely 15000 triangles/second (flat shaded), or approximately 250 on-screen triangles (after culling) at 60fps at 480x320, or 500 at 30fps which puts it somewhere between the Sega 32X and Sega Saturn in terms of performance at that resolution.
 
+## Join us on Discord!
+
+Show off your projects, chat with other users or ask for help and advice using Jet on the official [Discord server](https://discord.gg/FSdJYDTEYt)!
+
 ## Demo
 
 A demonstration of a Wipeout-style game built on Jet, running on an
