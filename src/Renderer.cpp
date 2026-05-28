@@ -54,6 +54,170 @@ static inline uint16_t blendRGB565(uint16_t dst, uint16_t src, uint8_t alpha)
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
+// -----------------------------------------------------------------------------
+// Directional lighting (lit-only contribution).
+//
+// Returns the directional + view-facing-specular term as a scalar in
+// [0, 255 + specularCoef]. The ambient component is intentionally NOT folded
+// in here: ambient is a per-channel tint applied during colour modulation,
+// so that an `AmbientLight({160, 164, 180})` actually produces a cool-blue
+// shadow rather than the same neutral grey it would as a scalar floor.
+//
+// Inputs are integer view-space vectors with nominal magnitude
+// FIXED_POINT_SCALE (1024). The dot product therefore lives in
+// [-FPS², +FPS²] == [-1,048,576, +1,048,576].
+//
+// Sign convention: `L` points FROM the surface TOWARD the light source (this
+// is what DirectionalLight::calculateLightDirection() produces from its
+// azimuth/elevation pair). When N and L are aligned (N·L = +|N||L|) the
+// surface fully faces the light; when opposed (N·L = -|N||L|) the surface
+// faces away and the directional contribution is zero.
+//
+// View-facing "specular": rather than a true Blinn-Phong H·N evaluation
+// (which needs a normalise and a power per pixel), the renderer cheats with
+// the fact that in view space the camera looks down +Z, so the vector from
+// the surface back toward the camera is V = (0, 0, -1). A surface facing
+// the camera has N.z < 0, and (-N.z)/FPS is the cosine of the angle to V.
+// Squaring it tightens the falloff so the result reads more like a specular
+// lobe than a flat fresnel term, and it's gated on the Lambert factor so
+// the highlight only appears on the lit hemisphere.
+// -----------------------------------------------------------------------------
+static inline uint16_t jetShadeBrightness(const Vector3& N, const Vector3& L,
+                                          uint16_t lightIntensity,
+                                          uint8_t diffuseCoef,
+                                          uint8_t specularCoef,
+                                          uint16_t lambertGainQ8 = 256)
+{
+    if (lightIntensity > 255) lightIntensity = 255;
+    const uint32_t maxBrightness = 255u + specularCoef;
+
+    // Lambertian diffuse term. L points toward the light source, so a
+    // positive dot product means the surface faces the light.
+    int64_t lit = Vector3::dotProduct(N, L);
+    if (lit <= 0) return 0;
+
+    // Map [0, FPS²] → [0, 255]. With FPS=1024, FPS²=1,048,576, so >>12
+    // gives [0, 256]; clamp the top end.
+    uint32_t lambert = (uint32_t)(lit >> 12);
+    if (lambert > 255) lambert = 255;
+
+    // Falloff exaggeration. Square the Lambert term to bend the cosine
+    // curve down into the midtones: a face that's 70% facing the light
+    // would naturally return 0.70 brightness but now returns 0.49, and
+    // 50% drops to 0.25. Faces directly under the sun (1.0) are
+    // unchanged at 1.0, so peaks aren't blown — only the falloff is
+    // amplified. This makes a rotating object darken visibly as it
+    // turns away from the sun, rather than the gentle linear tint that
+    // raw Lambert produces. (lambert * lambert + 128) >> 8 keeps the
+    // result in [0, 255] with one rounding bit of headroom.
+    lambert = (lambert * lambert + 128) >> 8;
+
+    // Optional lambert gain (Q8). Default 256 (1.0×) preserves the
+    // physically-plausible cosine response used by GOURAUD and PHONG,
+    // which interpolate brightness across the triangle and benefit from
+    // smooth midtones. FLAT shades the whole face from a single averaged
+    // normal, so the response is constant across a polygon and a 1.0×
+    // gain reads as a gentle tint rather than "this face is in the sun".
+    // The FLAT call site passes a value >256 to push lit faces past
+    // 100% base colour into the per-material specular headroom
+    // (maxBrightness = 255 + specular), producing the strong lit/shadow
+    // split typical of early-hardware flat-shaded scenes.
+    if (lambertGainQ8 != 256)
+    {
+        lambert = (lambert * lambertGainQ8) >> 8;
+        if (lambert > maxBrightness) lambert = maxBrightness;
+    }
+    lambert = (lambert * lightIntensity) >> 8;
+    uint32_t diffuseTerm = (lambert * diffuseCoef) >> 8;
+    if (diffuseTerm > maxBrightness) diffuseTerm = maxBrightness;
+
+    uint32_t specularTerm = 0;
+    if (specularCoef && N.z < 0 && lambert > 0)
+    {
+        uint32_t viewFacing = (uint32_t)(-N.z);
+        if (viewFacing > FIXED_POINT_SCALE) viewFacing = FIXED_POINT_SCALE;
+        uint32_t vf8 = viewFacing >> 2;
+        if (vf8 > 255) vf8 = 255;
+        uint32_t vf2 = (vf8 * vf8) >> 8;
+        vf2 = (vf2 * lambert) >> 8;
+        vf2 = (vf2 * lightIntensity) >> 8;
+        specularTerm = (vf2 * specularCoef) >> 8;
+    }
+
+    uint32_t total = diffuseTerm + specularTerm;
+    if (total > maxBrightness) total = maxBrightness;
+    return (uint16_t)total;
+}
+
+// Per-channel coloured modulation.
+//
+// Combines a triangle-constant ambient tint (per-channel 0..255) with a
+// per-pixel scalar directional/specular brightness contribution. The lit
+// scalar is added to each channel-specific ambient level before the
+// base-colour scaling, so a cool ambient under a warm sun produces visibly
+// warm lit faces and cool shadowed faces from a single neutral material.
+//
+// Each channel is handled independently; channels that overshoot 255 lerp
+// toward their max value (31/63/31), giving the blowout-to-white headroom
+// that `material->specular` opts into.
+// Per-channel coloured modulation.
+//
+// Lighting model (per channel, independently):
+//   scale_c = ambient_c + brightness                    (saturating)
+//   final_c = base_c × scale_c / 255                    (+ blow-out to max
+//                                                         above 255)
+//
+// `brightness` carries the directional + view-facing-specular contribution
+// in [0 .. 255 + specularCoef]; the band above 255 lerps the channel
+// toward its maximum (the headroom `material->specular` opts into).
+// `ambR/G/B` is the ambient light colour (0..255 per channel) added to the
+// modulation factor BEFORE the base multiply — i.e. ambient tints the
+// material rather than replacing it. A brown cliff facing away from the
+// sun is still recognisably brown (just dimmer and tinted by the ambient
+// hue) rather than going pure ambient-colour as it would with an additive
+// post-multiply ambient.
+//
+// Inputs are RGB565 base, 16-bit `brightness` (post-clamp by caller), 8-bit
+// per-channel ambient. Output is RGB565.
+static inline uint16_t jetModulateRGB565(uint16_t color,
+                                         uint16_t brightness,
+                                         uint8_t ambR, uint8_t ambG, uint8_t ambB,
+                                         uint16_t maxBrightness)
+{
+    const uint32_t base_r = (color >> 11) & 0x1F;
+    const uint32_t base_g = (color >>  5) & 0x3F;
+    const uint32_t base_b =  color        & 0x1F;
+
+    uint32_t tR = (uint32_t)brightness + ambR;
+    uint32_t tG = (uint32_t)brightness + ambG;
+    uint32_t tB = (uint32_t)brightness + ambB;
+    if (tR > maxBrightness) tR = maxBrightness;
+    if (tG > maxBrightness) tG = maxBrightness;
+    if (tB > maxBrightness) tB = maxBrightness;
+
+    auto channel5 = [](uint32_t base5, uint32_t t) -> uint32_t {
+        if (t > 255) {
+            const uint32_t blow = t - 255;
+            return base5 + ((31u - base5) * blow) / 256u;
+        }
+        const uint32_t v = base5 * t;
+        return (v + 128u + (v >> 8)) >> 8;
+    };
+    auto channel6 = [](uint32_t base6, uint32_t t) -> uint32_t {
+        if (t > 255) {
+            const uint32_t blow = t - 255;
+            return base6 + ((63u - base6) * blow) / 256u;
+        }
+        const uint32_t v = base6 * t;
+        return (v + 128u + (v >> 8)) >> 8;
+    };
+
+    const uint32_t r = channel5(base_r, tR);
+    const uint32_t g = channel6(base_g, tG);
+    const uint32_t b = channel5(base_b, tB);
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 namespace Renderer
 {    
     inline bool Rasterizer::shouldDrawPixel(int x, int y, uint8_t alpha)
@@ -108,7 +272,8 @@ namespace Renderer
         bool ignoreZBuffer,
         bool noWriteZBuffer,
         int zBias,
-        uint8_t objAlpha)
+        uint8_t objAlpha,
+        bool brightnessPrecomputed)
     {
         // Fold per-object fade alpha into the material alpha up front so
         // every downstream alpha decision (early-out, depth fog, stipple
@@ -194,56 +359,86 @@ namespace Renderer
         maxY = std::min(maxY, static_cast<int32_t>(screenHeight - 1));
 
 #if LIGHTING
-        const int32_t scaleFactor = FIXED_POINT_SCALE / 64;
         Vector3 normal = {0, 0, 0};
         uint16_t vertexBrightness[3] = {0, 0, 0};
+
+        // Per-channel ambient tint. The ambient light contributes a constant
+        // offset that is added to each colour channel independently during
+        // the final modulation step, so a cool-toned AmbientLight actually
+        // casts a cool tint into shadowed areas rather than just dimming
+        // them by a single scalar.
+        const uint8_t ambR = ambientLight ? ambientLight->color.r : 0;
+        const uint8_t ambG = ambientLight ? ambientLight->color.g : 0;
+        const uint8_t ambB = ambientLight ? ambientLight->color.b : 0;
+        const uint16_t lightIntensity = directionalLight ? directionalLight->intensity : 0;
 
         if (directionalLight)
         {
             if (material->shadingMode == ShadingMode::FLAT)
             {
-                // Use the AVERAGE of the three transformed vertex normals as
-                // the face normal. v.normal has been rotated by the object
-                // and the camera matrices upstream, so it lives in the same
-                // camera-space coord system as directionalLight->lightDir.
+                // For FLAT shading we expect per-face vertex duplication
+                // (computeFlatNormals stamps the same face normal onto all
+                // three verts of each triangle). Pick the first vertex's
+                // normal directly — it already has unit magnitude FPS, no
+                // averaging or sqrt-normalize required. This is the per-
+                // triangle hot path on the ESP32-S3 where FLAT lighting
+                // was costing nearly 2x the no-lighting frame time; the
+                // sqrt+divide that lived here was the bulk of that cost.
                 //
-                // The previous code did a cross product on v1/v2/v3.position
-                // deltas — but at this point position.x/y are screen-space
-                // (already projected) while position.z is camera-space depth.
-                // That mixed-space cross product yields a garbage normal
-                // whose direction whips around as the camera pans a pixel,
-                // which is what was making every triangle in a lit scene
-                // flicker violently between brightnesses every frame.
-                normal.assign(v1.normal.x + v2.normal.x + v3.normal.x,
-                              v1.normal.y + v2.normal.y + v3.normal.y,
-                              v1.normal.z + v2.normal.z + v3.normal.z);
-                auto normalLength = normal.length();
-                if (normalLength > 0)
-                {
-                    normal = (normal * static_cast<int32_t>(1024)) / normalLength;
-                }
+                // For meshes where vertex normals genuinely differ across
+                // a face (i.e. smooth-shaded geometry erroneously assigned
+                // FLAT), the result is identical to picking ANY one of the
+                // three normals — which is acceptable because FLAT shading
+                // is not the right pipeline for that geometry anyway.
+                normal = v1.normal;
             }
             else if (material->shadingMode == ShadingMode::GOURAUD)
             {
-                // Calculate brightness for each vertex
-                for (int i = 0; i < 3; i++)
+                // Per-vertex Lambertian + view-facing specular. The triangle
+                // body of the rasterizer interpolates vertexBrightness[]
+                // linearly across the face (plane-equation incremental form
+                // in the inner loops below).
+                if (brightnessPrecomputed)
                 {
-                    const Object::Vertex &v = (i == 0) ? v1 : ((i == 1) ? v2 : v3);
-                    int64_t dotProduct = Vector3::dotProduct(v.normal, directionalLight->lightDir) / scaleFactor;
-                    dotProduct = std::max(dotProduct, static_cast<int64_t>(-512));
-                    int64_t adjustedBrightness = (dotProduct + 255) / 2;
-                    vertexBrightness[i] = static_cast<uint16_t>((adjustedBrightness * material->diffuse) / FIXED_POINT_SCALE);
-                    if (ambientLight)
-                        vertexBrightness[i] += ambientLight->color.r;
-                    // Cap vertex brightness based on specular value
-                    uint16_t maxBrightness = 255 + ((material->specular * 256) / 255);
-                    vertexBrightness[i] = std::min(vertexBrightness[i], maxBrightness);
+                    // Object-local-light path: Scene.cpp has already
+                    // evaluated diffuse Lambert per-vertex in mesh-local
+                    // space; just read it back. Saves three dot/clamp/
+                    // square-falloff sequences per triangle.
+                    vertexBrightness[0] = v1.lambertBrightness;
+                    vertexBrightness[1] = v2.lambertBrightness;
+                    vertexBrightness[2] = v3.lambertBrightness;
+                }
+                else
+                {
+                    const Object::Vertex* verts[3] = { &v1, &v2, &v3 };
+                    for (int i = 0; i < 3; i++)
+                    {
+                        vertexBrightness[i] = jetShadeBrightness(
+                            verts[i]->normal,
+                            directionalLight->lightDir,
+                            lightIntensity,
+                            material->diffuse,
+                            material->specular);
+                    }
                 }
             }
         }
 #endif
 
         uint16_t color = material->getColor({0, 0});
+        // Untextured triangles use this single material colour as the
+        // per-pixel modulation input. Keeping the unmodulated base in a
+        // separate variable is critical: previously the per-pixel
+        // modulation wrote back into `color`, so each subsequent pixel
+        // on the scanline modulated an already-modulated colour and the
+        // result converged toward black across the span — the entire
+        // reason untextured surfaces (clouds, walls) were rendering as
+        // solid black bands. Textured triangles re-sample `color` from
+        // the diffuse map each pixel and don't read `baseColor`. FLAT
+        // materials short-circuit via `flatColorPrecomputed` and bake
+        // the modulation into `color` once at triangle setup — they
+        // intentionally skip per-pixel modulation entirely.
+        const uint16_t baseColor = color;
 
 #if TEXTURE_MAPPING
         // Distance-based texture LOD. textureLodFade goes from 255 (full
@@ -318,27 +513,38 @@ namespace Renderer
         {
             if (directionalLight)
             {
-                const Vector3 &lightDir = directionalLight->lightDir;
-
-                // Simple dot product calculation
-                int64_t dotProduct = Vector3::dotProduct(normal, lightDir) / scaleFactor;
-
-                // Map from [-512, 512] to [0, 255] range
-                brightness = ((dotProduct + 512) * 255) / 1024;
-
-                // Apply material diffuse property
-                brightness = (brightness * material->diffuse) / FIXED_POINT_SCALE;
+                // FLAT shading uses the natural Lambertian response.
+                // The speedup from picking v1.normal directly (no sqrt-
+                // normalize) turned out to give plenty of perceived
+                // contrast on its own — the previous artificial lambert
+                // gain + extra specular headroom blew everything out.
+                if (brightnessPrecomputed)
+                {
+                    // Object-local-light path: v1.lambertBrightness was
+                    // precomputed by Scene.cpp using the mesh-local
+                    // normal + object-local light dir. computeFlatNormals
+                    // stamps identical normals on all three verts of a
+                    // FLAT face, so any vertex's cached value is the
+                    // face brightness.
+                    brightness = v1.lambertBrightness;
+                }
+                else
+                {
+                    brightness = jetShadeBrightness(
+                        normal,
+                        directionalLight->lightDir,
+                        lightIntensity,
+                        material->diffuse,
+                        material->specular);
+                }
             }
-
-            if (ambientLight)
+            else
             {
-                // Add ambient light contribution
-                brightness += ambientLight->color.r; // Example value; adjust as needed
+                // Ambient-only: the per-channel ambient tint is applied in
+                // the modulation step, so the lit-scalar contribution is
+                // zero here.
+                brightness = 0;
             }
-
-            // Cap maximum brightness based on specular value
-            uint16_t maxBrightness = 255 + ((material->specular * 256) / 255);
-            brightness = std::min(brightness, maxBrightness);
         }
 #endif
 
@@ -366,28 +572,30 @@ namespace Renderer
 #endif
         if (flatShaded && !emissive && !diffuseMapSamples)
         {
-            if (brightness >= 255)
-            {
-                const uint16_t blowout = brightness - 255;
-                uint8_t r = ((color >> 11) & 0x1F);
-                uint8_t g = ((color >>  5) & 0x3F);
-                uint8_t b = ( color        & 0x1F);
-                r = (uint8_t)(r + ((31 - r) * blowout) / 256);
-                g = (uint8_t)(g + ((63 - g) * blowout) / 256);
-                b = (uint8_t)(b + ((31 - b) * blowout) / 256);
-                color = (uint16_t)((r << 11) | (g << 5) | b);
-            }
-            else
-            {
-                const uint16_t br = ((color >> 11) & 0x1F) * brightness;
-                const uint16_t bg = ((color >>  5) & 0x3F) * brightness;
-                const uint16_t bb = ( color        & 0x1F) * brightness;
-                const uint8_t r = (uint8_t)((br + 128 + (br >> 8)) >> 8);
-                const uint8_t g = (uint8_t)((bg + 128 + (bg >> 8)) >> 8);
-                const uint8_t b = (uint8_t)((bb + 128 + (bb >> 8)) >> 8);
-                color = (uint16_t)((r << 11) | (g << 5) | b);
-            }
+            const uint16_t maxBrightness = (uint16_t)(255u + material->specular);
+            color = jetModulateRGB565(color, brightness, ambR, ambG, ambB, maxBrightness);
             flatColorPrecomputed = true;
+        }
+
+        // For untextured non-flat (GOURAUD / PHONG) triangles the base
+        // colour is triangle-constant; only `brightness` varies per pixel.
+        // Hoist the RGB565 channel extract and the saturating maxBrightness
+        // here so the inner loop becomes "build per-channel t from brightness +
+        // const ambient, multiply, pack" — no function call, no re-extract.
+        // This is the dominant rasterization cost in the scene (most
+        // triangles are flat-coloured GOURAUD), so saving the per-pixel
+        // function-call + channel extract is the single biggest LIGHTING
+        // perf knob.
+        const bool litPerPixelUntextured =
+            !flatColorPrecomputed && !emissive && !diffuseMapSamples;
+        uint32_t litBaseR5 = 0, litBaseG6 = 0, litBaseB5 = 0;
+        uint16_t litMaxBrightness = 255;
+        if (litPerPixelUntextured)
+        {
+            litBaseR5 = (baseColor >> 11) & 0x1F;
+            litBaseG6 = (baseColor >>  5) & 0x3F;
+            litBaseB5 =  baseColor        & 0x1F;
+            litMaxBrightness = (uint16_t)(255u + material->specular);
         }
 #endif
 
@@ -475,15 +683,28 @@ namespace Renderer
         // is roughly 30x cheaper on Xtensa (no divide, no multi-multiply).
         // brightness is tracked in Q16 fixed-point so per-pixel deltas
         // smaller than 1 don't quantise to zero across a wide row.
+        //
+        // int64 throughout the setup: vertexBrightness peaks at 255+specular
+        // (= 510 worst case) and dw_dx_step can be in the millions for
+        // huge near-camera triangles, so the int32 product overflowed and
+        // produced wildly-wrong row slopes (the "track flashes random
+        // colours" artefact). Per-pixel cost is unchanged — the inner loop
+        // still steps an int32 accumulator.
         int32_t brightness_dx_step_q16 = 0;
         const bool useIncrementalGouraud =
             directionalLight && material->shadingMode == ShadingMode::GOURAUD;
         if (useIncrementalGouraud)
         {
-            const int32_t bDx = vertexBrightness[0] * dw0_dx_step
-                              + vertexBrightness[1] * dw1_dx_step
-                              + vertexBrightness[2] * dw2_dx_step;
-            brightness_dx_step_q16 = (int32_t)(((int64_t)bDx << 16) / denom);
+            const int64_t bDx = (int64_t)vertexBrightness[0] * dw0_dx_step
+                              + (int64_t)vertexBrightness[1] * dw1_dx_step
+                              + (int64_t)vertexBrightness[2] * dw2_dx_step;
+            // denom is divided in int64 here. Using the int32-narrowed
+            // `denom` produced randomly-dark/flashing triangles when the
+            // camera got close enough that the projected vertex coords
+            // pushed denom64 past INT32_MAX (the rasterizer accepts that
+            // truncation for per-pixel edge math, but the lighting
+            // divides are highly sensitive to denom sign/magnitude).
+            brightness_dx_step_q16 = (int32_t)((bDx << 16) / denom64);
         }
 #endif
 
@@ -554,6 +775,39 @@ namespace Renderer
             const int xStart = minX + (int)iStart * xStep;
             const int xEnd   = minX + (int)iEnd   * xStep;
 
+            // Wireframe / outline mode. The per-row solver above already
+            // gave us the leftmost and rightmost x for this scanline of
+            // the triangle; plotting just those two pixels (one when the
+            // row is a single pixel wide, e.g. at the top/bottom apex)
+            // traces the triangle's silhouette. We skip the entire span
+            // body — no z-buffer, no lighting, no texturing, no dither —
+            // which is what the production fill path was eating cycles
+            // on for huge near-camera triangles in the previous
+            // Bresenham-edge implementation. The fill is replaced with
+            // at most two stores per scanline.
+            if (wireframeMode)
+            {
+                const uint16_t wireColor = material->color;
+                auto plotWire = [this, wireColor](int px, int py) {
+#if HALF_WIDTH_BUFFERS
+    #if FIELD_BUFFERS
+                    framebuffer[(py >> 1) * (screenWidth / 2) + (px >> 1)] = wireColor;
+    #else
+                    framebuffer[py * (screenWidth / 2) + (px >> 1)] = wireColor;
+    #endif
+#else
+    #if FIELD_BUFFERS
+                    framebuffer[(py >> 1) * screenWidth + px] = wireColor;
+    #else
+                    framebuffer[py * screenWidth + px] = wireColor;
+    #endif
+#endif
+                };
+                plotWire(xStart, y);
+                if (xEnd != xStart) plotWire(xEnd, y);
+                continue;
+            }
+
 #if MAX_PICK_QUERIES > 0
             // Per-row screen-space pick test. Cheap (MAX_PICK_QUERIES is
             // tiny and compile-time bounded) and sees every triangle that
@@ -619,7 +873,10 @@ namespace Renderer
                 const int64_t bRowNum = (int64_t)vertexBrightness[0] * ew0
                                       + (int64_t)vertexBrightness[1] * ew1
                                       + (int64_t)vertexBrightness[2] * ew2;
-                brightness_q16 = (int32_t)((bRowNum << 16) / denom);
+                // See note at brightness_dx_step_q16 setup: divide by
+                // the full-precision int64 denom or super-near triangles
+                // flash dark when denom64 overflows int32.
+                brightness_q16 = (int32_t)((bRowNum << 16) / denom64);
             }
 #endif
 
@@ -987,63 +1244,44 @@ namespace Renderer
                         // original (b0*w0 + b1*w1 + b2*w2)/denom but trades
                         // a per-pixel divide + 3 multiplies for a single
                         // int32 add per pixel.
+                        //
+                        // Clamp into the legitimate brightness band
+                        // [0, 255 + specular]. Without this cap any minor
+                        // overshoot from incremental rounding (or a near-
+                        // camera triangle where the q16 slope is large)
+                        // landed in the deep "blowout" range and the
+                        // per-pixel modulation pushed channels far past
+                        // full-white into wrap-around territory — the
+                        // bright random-colour flashes the user was seeing.
                         int32_t b = brightness_q16 >> 16;
+                        const int32_t bMax = 255 + material->specular;
                         if (b < 0) b = 0;
-                        if (b > 65535) b = 65535;
+                        if (b > bMax) b = bMax;
                         brightness = (uint16_t)b;
                     }
                     else if (material->shadingMode == ShadingMode::PHONG)
                     {
-                        // Interpolate normals and calculate lighting per pixel
+                        // Interpolate normals and shade per pixel. The shared
+                        // helper handles Lambert + view-facing specular and
+                        // the brightness cap; PHONG just pays the per-pixel
+                        // normal renormalisation cost on top of GOURAUD.
                         Vector3 pixelNormal;
                         pixelNormal.x = (v1.normal.x * w0 + v2.normal.x * w1 + v3.normal.x * w2) / denom;
                         pixelNormal.y = (v1.normal.y * w0 + v2.normal.y * w1 + v3.normal.y * w2) / denom;
                         pixelNormal.z = (v1.normal.z * w0 + v2.normal.z * w1 + v3.normal.z * w2) / denom;
 
-                        // Normalize interpolated normal
                         auto normalLength = pixelNormal.length();
                         if (normalLength > 0)
                         {
-                            pixelNormal = (pixelNormal * static_cast<int32_t>(1024)) / normalLength;
+                            pixelNormal = (pixelNormal * static_cast<int32_t>(FIXED_POINT_SCALE)) / normalLength;
                         }
 
-                        // Calculate diffuse lighting using the interpolated normal
-                        int64_t dotProduct = Vector3::dotProduct(pixelNormal, directionalLight->lightDir) / scaleFactor;
-                        dotProduct = std::max(dotProduct, static_cast<int64_t>(-512));
-                        int64_t adjustedBrightness = (dotProduct + 255) / 2;
-                        brightness = static_cast<uint16_t>((adjustedBrightness * material->diffuse) / FIXED_POINT_SCALE);
-
-                        // Calculate specular reflection if material has specular component
-                        if (material->specular > 0)
-                        {
-                            // Calculate reflection vector R = 2(N·L)N - L
-                            int32_t twoNdotL = 2 * (Vector3::dotProduct(pixelNormal, directionalLight->lightDir) / FIXED_POINT_SCALE);
-                            Vector3 reflectionVector = (pixelNormal * twoNdotL) - directionalLight->lightDir;
-                            
-                            // View vector in screen space is approximately (0,0,1)
-                            static const Vector3 viewVector = {0, 0, FIXED_POINT_SCALE};
-                            
-                            // Calculate R·V (reflection · view)
-                            int64_t specDot = Vector3::dotProduct(reflectionVector, viewVector) / FIXED_POINT_SCALE;
-                            
-                            // Only add specular when the angle is less than 90 degrees
-                            if (specDot > 0)
-                            {
-                                // Approximate pow() with multiple multiplications for performance
-                                int32_t specPower = (specDot * specDot) / FIXED_POINT_SCALE; // Square it for a basic specular effect
-                                int32_t specIntensity = (specPower * material->specular) / FIXED_POINT_SCALE;
-                                brightness += specIntensity; // Allow to go above 255 for blow-out effect
-                            }
-                        }
-
-                        if (ambientLight)
-                            brightness += ambientLight->color.r;
-                        
-                        // Cap maximum brightness based on specular value
-                        // 0 specular = cap at 255
-                        // 255 specular = cap at 511
-                        uint16_t maxBrightness = 255 + ((material->specular * 256) / 255);
-                        brightness = std::min(brightness, maxBrightness);
+                        brightness = jetShadeBrightness(
+                            pixelNormal,
+                            directionalLight->lightDir,
+                            lightIntensity,
+                            material->diffuse,
+                            material->specular);
                     }
                 }
 #endif
@@ -1066,28 +1304,53 @@ namespace Renderer
                 if (!emissive)
 #endif
                 {
+#if LIGHTING
+                    // Per-pixel modulation. Two paths:
+                    //   1) Untextured (litPerPixelUntextured): base channels
+                    //      were extracted once at triangle setup; inline the
+                    //      add+saturate+multiply directly so the inner loop
+                    //      has no function call and no re-extract.
+                    //   2) Textured: `color` is the freshly-sampled texel,
+                    //      so we need the general per-channel helper.
+                    if (litPerPixelUntextured)
+                    {
+                        uint32_t tR = (uint32_t)brightness + ambR;
+                        uint32_t tG = (uint32_t)brightness + ambG;
+                        uint32_t tB = (uint32_t)brightness + ambB;
+                        if (tR > litMaxBrightness) tR = litMaxBrightness;
+                        if (tG > litMaxBrightness) tG = litMaxBrightness;
+                        if (tB > litMaxBrightness) tB = litMaxBrightness;
+
+                        uint32_t r, g, b;
+                        if (tR > 255) { uint32_t blow = tR - 255; r = litBaseR5 + ((31u - litBaseR5) * blow) / 256u; }
+                        else          { uint32_t v = litBaseR5 * tR; r = (v + 128u + (v >> 8)) >> 8; }
+                        if (tG > 255) { uint32_t blow = tG - 255; g = litBaseG6 + ((63u - litBaseG6) * blow) / 256u; }
+                        else          { uint32_t v = litBaseG6 * tG; g = (v + 128u + (v >> 8)) >> 8; }
+                        if (tB > 255) { uint32_t blow = tB - 255; b = litBaseB5 + ((31u - litBaseB5) * blow) / 256u; }
+                        else          { uint32_t v = litBaseB5 * tB; b = (v + 128u + (v >> 8)) >> 8; }
+                        color = (uint16_t)((r << 11) | (g << 5) | b);
+                    }
+                    else
+                    {
+                        const uint16_t maxBrightness = (uint16_t)(255u + material->specular);
+                        color = jetModulateRGB565(color, brightness, ambR, ambG, ambB, maxBrightness);
+                    }
+#else
+                    // Z_BRIGHTNESS-only path: no ambient light, just a
+                    // scalar brightness applied to all three channels.
                     if (brightness >= 255)
                     {
-                        // Blend towards white for brightness values above 255
                         uint16_t blowout = brightness - 255;
                         uint8_t r = ((color >> 11) & 0x1F);
                         uint8_t g = ((color >> 5) & 0x3F);
                         uint8_t b = (color & 0x1F);
-                        
-                        // Blend each component towards its maximum value
                         r = r + ((31 - r) * blowout) / 256;
                         g = g + ((63 - g) * blowout) / 256;
                         b = b + ((31 - b) * blowout) / 256;
-                        
                         color = (r << 11) | (g << 5) | b;
                     }
                     else
                     {
-                        // Normal diffuse lighting for brightness 0-255.
-                        // Replace the per-channel `(ch * b + 127) / 255` with
-                        // the standard divide-by-255 trick: for x in [0..255*63],
-                        // (x + 128 + (x >> 8)) >> 8 == round(x/255). One add
-                        // and one shift per channel instead of a divide.
                         const uint16_t br = ((color >> 11) & 0x1F) * brightness;
                         const uint16_t bg = ((color >>  5) & 0x3F) * brightness;
                         const uint16_t bb = ( color        & 0x1F) * brightness;
@@ -1096,6 +1359,7 @@ namespace Renderer
                         const uint8_t b = (uint8_t)((bb + 128 + (bb >> 8)) >> 8);
                         color = (r << 11) | (g << 5) | b;
                     }
+#endif
                 }
 #endif
 #endif

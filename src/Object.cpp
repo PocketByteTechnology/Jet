@@ -108,6 +108,47 @@ namespace Renderer
         addTriangle(v3, v4, v1, material); // Second triangle
     }
 
+    void Object::computeFlatNormals()
+    {
+        // Per-triangle face normal via cross product on int64 to survive
+        // any reasonable design-unit coordinate range (positions can be
+        // thousands of units pre-WORLD_SCALE; products would overflow
+        // int32 on big scenery). The length is computed from those int64
+        // intermediates and we then rescale to FIXED_POINT_SCALE so the
+        // resulting vector matches the convention the renderer expects.
+        for (const auto& tri : triangles) {
+            Vertex& a = vertices[tri.v1];
+            Vertex& b = vertices[tri.v2];
+            Vertex& c = vertices[tri.v3];
+
+            const int64_t ux = (int64_t)b.position.x - a.position.x;
+            const int64_t uy = (int64_t)b.position.y - a.position.y;
+            const int64_t uz = (int64_t)b.position.z - a.position.z;
+            const int64_t vx = (int64_t)c.position.x - a.position.x;
+            const int64_t vy = (int64_t)c.position.y - a.position.y;
+            const int64_t vz = (int64_t)c.position.z - a.position.z;
+
+            const int64_t nx = uy * vz - uz * vy;
+            const int64_t ny = uz * vx - ux * vz;
+            const int64_t nz = ux * vy - uy * vx;
+
+            // Integer sqrt of nx² + ny² + nz². Use double here — this is a
+            // one-shot setup cost per triangle at mesh-build time, not a
+            // per-frame hot path, so the floating-point detour is fine.
+            const double mag = std::sqrt((double)nx*nx + (double)ny*ny + (double)nz*nz);
+            if (mag <= 0.0) continue;
+
+            const double s = (double)FIXED_POINT_SCALE / mag;
+            const int32_t fx = (int32_t)(nx * s);
+            const int32_t fy = (int32_t)(ny * s);
+            const int32_t fz = (int32_t)(nz * s);
+
+            a.normal.x = fx; a.normal.y = fy; a.normal.z = fz;
+            b.normal.x = fx; b.normal.y = fy; b.normal.z = fz;
+            c.normal.x = fx; c.normal.y = fy; c.normal.z = fz;
+        }
+    }
+
     void Object::setPosition(int32_t x, int32_t y, int32_t z)
     {
         position.x = x;

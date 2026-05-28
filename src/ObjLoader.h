@@ -247,6 +247,20 @@ using namespace Renderer;
                         (int32_t)(tempUVs[(t - 1) * 2] * FIXED_POINT_SCALE),
                         (int32_t)(tempUVs[(t - 1) * 2 + 1] * FIXED_POINT_SCALE)
                     };
+                    // Lighting needs per-vertex normals in fixed-point with
+                    // magnitude FIXED_POINT_SCALE. Without this assignment
+                    // every imported model lit only by ambient (Lambert's
+                    // dot product is always 0 for a zero-length normal),
+                    // which is why ship faces never changed colour with
+                    // orientation regardless of how the directional light
+                    // was configured.
+                    if (n > 0 && (size_t)(n * 3) <= tempNormals.size()) {
+                        vert.normal = {
+                            (int32_t)(tempNormals[(n - 1) * 3]     * FIXED_POINT_SCALE),
+                            (int32_t)(tempNormals[(n - 1) * 3 + 1] * FIXED_POINT_SCALE),
+                            (int32_t)(tempNormals[(n - 1) * 3 + 2] * FIXED_POINT_SCALE)
+                        };
+                    }
                     return vert;
                 };
 

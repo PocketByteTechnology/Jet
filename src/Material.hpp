@@ -32,10 +32,12 @@ public:
     /// @param color Base colour in RGB565.
     /// @param diffuseMap Optional diffuse texture.
     /// @param shader Optional custom shader.
-    /// @param emissive Bypass lighting if true.
-    /// @param alpha Per-material alpha (0..255).
-    /// @param diffuse Diffuse coefficient (0..255).
-    /// @param specular Specular coefficient (0..255).
+    /// @param specular Specular coefficient (0..255). Also widens the
+    ///        per-pixel brightness ceiling (the renderer caps brightness
+    ///        at 255 + specular), so non-zero values let lit surfaces
+    ///        blow past 100% base colour toward white. Default 0 keeps
+    ///        GOURAUD/PHONG on a physically-plausible 1.0× response;
+    ///        the FLAT path supplies its own headroom locally.
     Material(uint16_t color = 0xFFFF, Texture* diffuseMap = nullptr, Shader* shader = nullptr, bool emissive = false, uint8_t alpha = 255, uint8_t diffuse = 255, uint8_t specular = 0);
 
     /// @brief Convenience constructor for an untextured material with explicit alpha.

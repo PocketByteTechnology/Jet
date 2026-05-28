@@ -8,6 +8,36 @@
 
 namespace Renderer {
 
+#if LIGHTING
+// Diffuse-only Lambert shading, evaluated in whatever frame N and L
+// share (object-local for the precompute path below). Matches the
+// diffuse branch of Renderer.cpp's jetShadeBrightness when
+// specularCoef == 0: 12-bit reduce, clamp, square-falloff, scale by
+// lightIntensity, scale by diffuseCoef, clamp.
+//
+// The specular branch is intentionally absent — this helper is only
+// used for objects whose materials are ALL non-specular, which is the
+// exact precondition for skipping the view-space normal transform.
+// Inlining the specular branch here would mean its `N.z < 0` test
+// would be reading an object-local component instead of view-space Z
+// and give wrong results.
+static inline uint16_t sceneLambertDiffuse(const Vector3& N, const Vector3& L,
+                                           uint16_t lightIntensity,
+                                           uint8_t diffuseCoef)
+{
+    if (lightIntensity > 255) lightIntensity = 255;
+    int64_t lit = Vector3::dotProduct(N, L);
+    if (lit <= 0) return 0;
+    uint32_t lambert = (uint32_t)(lit >> 12);
+    if (lambert > 255) lambert = 255;
+    lambert = (lambert * lambert + 128) >> 8;       // squared falloff
+    lambert = (lambert * lightIntensity) >> 8;
+    uint32_t diffuseTerm = (lambert * diffuseCoef) >> 8;
+    if (diffuseTerm > 255) diffuseTerm = 255;
+    return (uint16_t)diffuseTerm;
+}
+#endif
+
 // Returns true if the object's AABB is entirely outside the view frustum.
 bool Scene::cullObject(Object* obj,
                        int32_t camCosX, int32_t camSinX,
@@ -199,6 +229,18 @@ void PERF_CRITICAL Scene::clearBuffers() {
     //cast the framebuffer to a 32-bit pointer
     uint32_t* framebuffer32 = (uint32_t*)framebuffer;
 
+    // Wireframe mode forces a solid black background regardless of the
+    // configured backcolor / gradient so the outlines pop. We detour the
+    // gradient and backcolor for the duration of this clear and restore
+    // them on the way out so the host-visible state is unchanged.
+    uint16_t* savedGradient = backgroundGradientColors;
+    uint16_t  savedBack     = backcolor;
+    const bool wireClear = (renderer && renderer->wireframeMode);
+    if (wireClear) {
+        backgroundGradientColors = nullptr;
+        backcolor = 0;
+    }
+
     if (clearRenderBuffer) {
         if (renderer->checkerboardMode) {
             // Checkerboard clear: only wipe current-parity pixels. Opposite-parity
@@ -301,6 +343,13 @@ void PERF_CRITICAL Scene::clearBuffers() {
         }
     }
     //memset(scanlinesUpdated, 0, screenHeight * sizeof(bool));
+
+    // Restore the host-visible background state regardless of whether we
+    // detoured it for the wireframe-mode clear above.
+    if (wireClear) {
+        backgroundGradientColors = savedGradient;
+        backcolor = savedBack;
+    }
 }
 
 void Scene::render() {
@@ -504,7 +553,8 @@ void Scene::render() {
                                    directionalLight, ambientLight,
                                    renderEvenLines,
                                    t.ignoreZBuffer, t.noWriteZBuffer,
-                                   (int)t.zBias, t.objAlpha)) {
+                                   (int)t.zBias, t.objAlpha,
+                                   t.brightnessPrecomputed)) {
             ++rasterized;
         }
     }
@@ -604,15 +654,158 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // scenery), saving 12 mul + 6 div + 9 add per vertex.
     const bool objHasRotation = !isBillboard &&
         (obj->rotation.x != 0 || obj->rotation.y != 0 || obj->rotation.z != 0);
-    int32_t objCosX = 0, objSinX = 0, objCosY = 0, objSinY = 0, objCosZ = 0, objSinZ = 0;
+
+    // Composed object rotation matrix (Rz * Ry * Rx, since the previous
+    // per-vertex code applied X→Y→Z). Storing all 9 entries at
+    // FIXED_POINT_SCALE scale lets the per-vertex transform collapse from
+    // three cascaded rotations (12 muls + 12 div per vertex) into a single
+    // 3×3 mat-vec (9 muls + 3 div), with the same again saved on the
+    // normal when LIGHTING is on. The trig product entries are pre-divided
+    // by FIXED_POINT_SCALE so the entire matrix lives at one consistent
+    // scale.
+    int32_t objM00=FIXED_POINT_SCALE, objM01=0, objM02=0;
+    int32_t objM10=0, objM11=FIXED_POINT_SCALE, objM12=0;
+    int32_t objM20=0, objM21=0, objM22=FIXED_POINT_SCALE;
     if (objHasRotation) {
-        objCosX = lookupCosI(obj->rotation.x);
-        objSinX = lookupSinI(obj->rotation.x);
-        objCosY = lookupCosI(obj->rotation.y);
-        objSinY = lookupSinI(obj->rotation.y);
-        objCosZ = lookupCosI(obj->rotation.z);
-        objSinZ = lookupSinI(obj->rotation.z);
+        const int32_t cx = lookupCosI(obj->rotation.x);
+        const int32_t sx = lookupSinI(obj->rotation.x);
+        const int32_t cy = lookupCosI(obj->rotation.y);
+        const int32_t sy = lookupSinI(obj->rotation.y);
+        const int32_t cz = lookupCosI(obj->rotation.z);
+        const int32_t sz = lookupSinI(obj->rotation.z);
+        // K = Ry * Rx (at FPS scale; trig-product entries divided once).
+        const int32_t k00 = cy;
+        const int32_t k01 = (int32_t)((int64_t)sy * sx / FIXED_POINT_SCALE);
+        const int32_t k02 = (int32_t)((int64_t)sy * cx / FIXED_POINT_SCALE);
+        const int32_t k10 = 0;
+        const int32_t k11 = cx;
+        const int32_t k12 = -sx;
+        const int32_t k20 = -sy;
+        const int32_t k21 = (int32_t)((int64_t)cy * sx / FIXED_POINT_SCALE);
+        const int32_t k22 = (int32_t)((int64_t)cy * cx / FIXED_POINT_SCALE);
+        // M = Rz * K (at FPS scale).
+        objM00 = (int32_t)(((int64_t)cz * k00 - (int64_t)sz * k10) / FIXED_POINT_SCALE);
+        objM01 = (int32_t)(((int64_t)cz * k01 - (int64_t)sz * k11) / FIXED_POINT_SCALE);
+        objM02 = (int32_t)(((int64_t)cz * k02 - (int64_t)sz * k12) / FIXED_POINT_SCALE);
+        objM10 = (int32_t)(((int64_t)sz * k00 + (int64_t)cz * k10) / FIXED_POINT_SCALE);
+        objM11 = (int32_t)(((int64_t)sz * k01 + (int64_t)cz * k11) / FIXED_POINT_SCALE);
+        objM12 = (int32_t)(((int64_t)sz * k02 + (int64_t)cz * k12) / FIXED_POINT_SCALE);
+        objM20 = k20;
+        objM21 = k21;
+        objM22 = k22;
     }
+
+    // Composed camera rotation matrix (Rz * Rx * Ry, since the previous
+    // per-vertex code applied Y→X→Z). Same scheme as the object matrix.
+    // Computed per object render rather than once per scene because the
+    // call cost is negligible (~9 muls / 9 divs) compared to the per-
+    // vertex savings; hoisting to renderScene would shave nine muls per
+    // *object*, not per vertex.
+    int32_t camM00, camM01, camM02;
+    int32_t camM10, camM11, camM12;
+    int32_t camM20, camM21, camM22;
+    {
+        const int32_t cx = camCosX, sx = camSinX;
+        const int32_t cy = camCosY, sy = camSinY;
+        const int32_t cz = camCosZ, sz = camSinZ;
+        // K = Rx * Ry
+        const int32_t k00 = cy;
+        const int32_t k01 = 0;
+        const int32_t k02 = sy;
+        const int32_t k10 = (int32_t)((int64_t)sx * sy / FIXED_POINT_SCALE);
+        const int32_t k11 = cx;
+        const int32_t k12 = (int32_t)(-(int64_t)sx * cy / FIXED_POINT_SCALE);
+        const int32_t k20 = (int32_t)(-(int64_t)cx * sy / FIXED_POINT_SCALE);
+        const int32_t k21 = sx;
+        const int32_t k22 = (int32_t)((int64_t)cx * cy / FIXED_POINT_SCALE);
+        // M = Rz * K
+        camM00 = (int32_t)(((int64_t)cz * k00 - (int64_t)sz * k10) / FIXED_POINT_SCALE);
+        camM01 = (int32_t)(((int64_t)cz * k01 - (int64_t)sz * k11) / FIXED_POINT_SCALE);
+        camM02 = (int32_t)(((int64_t)cz * k02 - (int64_t)sz * k12) / FIXED_POINT_SCALE);
+        camM10 = (int32_t)(((int64_t)sz * k00 + (int64_t)cz * k10) / FIXED_POINT_SCALE);
+        camM11 = (int32_t)(((int64_t)sz * k01 + (int64_t)cz * k11) / FIXED_POINT_SCALE);
+        camM12 = (int32_t)(((int64_t)sz * k02 + (int64_t)cz * k12) / FIXED_POINT_SCALE);
+        camM20 = k20;
+        camM21 = k21;
+        camM22 = k22;
+    }
+
+#if LIGHTING
+    // Object-local lighting precompute eligibility.
+    //
+    // The view-space normal transform exists only so that the rasterizer
+    // can evaluate the view-facing specular term (`N.z < 0` in
+    // jetShadeBrightness). For objects whose materials are ALL non-
+    // specular (`material->specular == 0`), there is no consumer of the
+    // view-space frame — diffuse Lambert is rotation-invariant — so we
+    // can skip the per-vertex normal transform entirely and instead
+    // transform the world-space light direction into the object's local
+    // space ONCE per object, then dot it against the untransformed
+    // vertex normal to get brightness. That brightness is cached on the
+    // vertex and read straight back out by drawTriangle, which also
+    // skips its own jetShadeBrightness call when the flag is set.
+    //
+    // On the ESP32 with FLAT shading + non-specular materials being the
+    // common case (track, ground, parapets, hulls), this deletes 9 muls
+    // + 3 shifts per vertex plus the dot/clamp/square cycle from the
+    // renderer's per-triangle path — replaced by a single 9-mul + 3-shift
+    // light-direction transform amortized over the whole object.
+    bool objectLocalLight = false;
+    Vector3 objLightDir = {0, 0, 0};
+    uint16_t objLightIntensity = 0;
+    uint8_t  objDiffuseCoef = 255;
+    if (directionalLight && !meshSource->triangles.empty()) {
+        bool allNonSpecular = true;
+        // Per-triangle material walk. Cheap — a handful of byte loads
+        // per face — and exits early on the first specular material we
+        // hit so specular-heavy objects (vehicles with shiny paint)
+        // skip the rest of the scan. If we ever start caching this on
+        // the Object itself we can drop the walk entirely; for now the
+        // overhead is well below the savings on qualifying objects.
+        //
+        // Also disqualifies PHONG materials: PHONG interpolates per-
+        // pixel from the vertex normals against directionalLight->lightDir
+        // (view-space) and there's no place to feed cached brightness
+        // back in. FLAT and GOURAUD both consume a per-triangle/vertex
+        // scalar brightness so they slot the cache in cleanly.
+        for (const auto& tri : meshSource->triangles) {
+            if (!tri.material) continue;
+            if (tri.material->specular != 0 ||
+                tri.material->shadingMode == ShadingMode::PHONG) {
+                allNonSpecular = false;
+                break;
+            }
+        }
+        if (allNonSpecular) {
+            objectLocalLight = true;
+            objLightIntensity = directionalLight->intensity;
+            // Diffuse coef varies per triangle; we use the first triangle's
+            // material as a representative. If diffuse coefs were ever
+            // mixed across an object's faces, GOURAUD-style midtones
+            // would shift slightly compared to the renderer's path. In
+            // practice diffuse is a per-shading-style constant on every
+            // material in this project (255 default).
+            const Material* m0 = meshSource->triangles[0].material;
+            if (m0) objDiffuseCoef = m0->diffuse;
+
+            // Transform worldLightDir into object-local space. With M
+            // composed as Rz*Ry*Rx (the same axis order applied to
+            // positions and normals above) and orthonormal, the inverse
+            // is the transpose: rows of M^T are columns of M, so we
+            // dot worldLightDir with the COLUMNS of objM. For identity
+            // object rotation we just use worldLightDir directly.
+            const Vector3& Lw = directionalLight->worldLightDir;
+            if (objHasRotation) {
+                objLightDir.assign(
+                    (int32_t)(((int64_t)Lw.x * objM00 + (int64_t)Lw.y * objM10 + (int64_t)Lw.z * objM20) / FIXED_POINT_SCALE),
+                    (int32_t)(((int64_t)Lw.x * objM01 + (int64_t)Lw.y * objM11 + (int64_t)Lw.z * objM21) / FIXED_POINT_SCALE),
+                    (int32_t)(((int64_t)Lw.x * objM02 + (int64_t)Lw.y * objM12 + (int64_t)Lw.z * objM22) / FIXED_POINT_SCALE));
+            } else {
+                objLightDir = Lw;
+            }
+        }
+    }
+#endif
 
     // Transform vertices and normals
     for (auto& vertex : transformedVertices) {
@@ -621,36 +814,43 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         Vector3 normal(vertex.normal);
 #endif
 
-        // Object rotation
+        // Y-axis (cylindrical) billboard: pre-rotate the vertex offset
+        // by +camRotY around Y so the camera's Y rotation below cancels
+        // it out exactly, leaving the offset's X axis mapped to
+        // camera-right and Y axis to world-Y. The billboard's world-
+        // space POSITION (objPos) goes through the normal camera
+        // transform unchanged, so it occupies real 3D space and
+        // distance-fades / sorts correctly; only its local orientation
+        // is locked to face the camera in yaw. Pitch/roll still apply
+        // through the camera transform so the billboard appears
+        // tilted exactly as a vertical real object would.
+        if (isBillboard) {
+            pos.assign((pos.x * camCosY - pos.z * camSinY) / FIXED_POINT_SCALE,
+                        pos.y,
+                       (pos.x * camSinY + pos.z * camCosY) / FIXED_POINT_SCALE);
+        }
+
+        // Object rotation — single 3×3 matrix apply, replacing the previous
+        // three cascaded axis rotations. Matrix is at FIXED_POINT_SCALE
+        // scale; the divide reduces back to world units. Skipped entirely
+        // when the object has identity rotation (true for most scenery).
         if (objHasRotation) {
-            // X-axis rotation
-            pos.assign(pos.x,
-                 (pos.y * objCosX - pos.z * objSinX) / FIXED_POINT_SCALE,
-                 (pos.y * objSinX + pos.z * objCosX) / FIXED_POINT_SCALE);
+            const int32_t px = pos.x, py = pos.y, pz = pos.z;
+            pos.assign(
+                (int32_t)(((int64_t)px * objM00 + (int64_t)py * objM01 + (int64_t)pz * objM02) / FIXED_POINT_SCALE),
+                (int32_t)(((int64_t)px * objM10 + (int64_t)py * objM11 + (int64_t)pz * objM12) / FIXED_POINT_SCALE),
+                (int32_t)(((int64_t)px * objM20 + (int64_t)py * objM21 + (int64_t)pz * objM22) / FIXED_POINT_SCALE));
 #if LIGHTING
-            normal.assign(normal.x,
-                   (normal.y * objCosX - normal.z * objSinX) / FIXED_POINT_SCALE,
-                   (normal.y * objSinX + normal.z * objCosX) / FIXED_POINT_SCALE);
-#endif
-
-            // Y-axis rotation
-            pos.assign((pos.x * objCosY + pos.z * objSinY) / FIXED_POINT_SCALE,
-                  pos.y,
-                 (-pos.x * objSinY + pos.z * objCosY) / FIXED_POINT_SCALE);
-#if LIGHTING
-            normal.assign((normal.x * objCosY + normal.z * objSinY) / FIXED_POINT_SCALE,
-                    normal.y,
-                   (-normal.x * objSinY + normal.z * objCosY) / FIXED_POINT_SCALE);
-#endif
-
-            // Z-axis rotation
-            pos.assign((pos.x * objCosZ - pos.y * objSinZ) / FIXED_POINT_SCALE,
-                 (pos.x * objSinZ + pos.y * objCosZ) / FIXED_POINT_SCALE,
-                  pos.z);
-#if LIGHTING
-            normal.assign((normal.x * objCosZ - normal.y * objSinZ) / FIXED_POINT_SCALE,
-                   (normal.x * objSinZ + normal.y * objCosZ) / FIXED_POINT_SCALE,
-                    normal.z);
+            // Normal goes through the object matrix only when we need a
+            // view-space normal downstream (specular path). The object-
+            // local-light path leaves normals in their mesh-local frame.
+            if (!objectLocalLight) {
+                const int32_t nx = normal.x, ny = normal.y, nz_ = normal.z;
+                normal.assign(
+                    (int32_t)(((int64_t)nx * objM00 + (int64_t)ny * objM01 + (int64_t)nz_ * objM02) / FIXED_POINT_SCALE),
+                    (int32_t)(((int64_t)nx * objM10 + (int64_t)ny * objM11 + (int64_t)nz_ * objM12) / FIXED_POINT_SCALE),
+                    (int32_t)(((int64_t)nx * objM20 + (int64_t)ny * objM21 + (int64_t)nz_ * objM22) / FIXED_POINT_SCALE));
+            }
 #endif
         }
 
@@ -658,58 +858,40 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         pos.add(objPos);
         pos.add(camPos.inverse());
 
-        // Camera space transformation
-        if (!isBillboard) {
-            // Apply camera rotation matrix
-            Vector3 rotated;
-            
-            // Apply Y rotation
-            rotated.assign((pos.x * camCosY + pos.z * camSinY) / FIXED_POINT_SCALE,
-                          pos.y,
-                         (-pos.x * camSinY + pos.z * camCosY) / FIXED_POINT_SCALE);
-            pos = rotated;
-
-            // Apply X rotation
-            rotated.assign(pos.x,
-                         (pos.y * camCosX - pos.z * camSinX) / FIXED_POINT_SCALE,
-                         (pos.y * camSinX + pos.z * camCosX) / FIXED_POINT_SCALE);
-            pos = rotated;
-
-            // Apply Z rotation
-            rotated.assign((pos.x * camCosZ - pos.y * camSinZ) / FIXED_POINT_SCALE,
-                         (pos.x * camSinZ + pos.y * camCosZ) / FIXED_POINT_SCALE,
-                          pos.z);
-            pos = rotated;
+        // Camera space transformation. Billboards go through the SAME
+        // transform as regular objects — the per-vertex pre-rotation
+        // above already cancels the camera Y rotation for them, which
+        // is what produces the "rotate yaw to face camera" effect
+        // while leaving translation/pitch/projection untouched.
+        //
+        // Single 3×3 matrix apply (was three cascaded rotations). The
+        // matrix composes Y→X→Z in the same order as the previous
+        // per-axis sequence and as Camera::transformDirection so that
+        // normals and lightDir continue to share a frame.
+        {
+            const int32_t px = pos.x, py = pos.y, pz = pos.z;
+            pos.assign(
+                (int32_t)(((int64_t)px * camM00 + (int64_t)py * camM01 + (int64_t)pz * camM02) / FIXED_POINT_SCALE),
+                (int32_t)(((int64_t)px * camM10 + (int64_t)py * camM11 + (int64_t)pz * camM12) / FIXED_POINT_SCALE),
+                (int32_t)(((int64_t)px * camM20 + (int64_t)py * camM21 + (int64_t)pz * camM22) / FIXED_POINT_SCALE));
 
 #if LIGHTING
-            // Transform normal using the same rotation matrix. Must apply
-            // the rotations in the SAME ORDER as the position transform
-            // above (Y -> X -> Z) and as Camera::transformDirection (which
-            // transforms the directional light into view space). If the
-            // orders disagree, normals and lightDir end up in slightly
-            // different frames whenever the camera is both pitched and
-            // yawed (i.e. a typical chase camera) and the dot product
-            // drifts with camera angle — surfaces appear to change
-            // brightness as you turn even though the world hasn't moved.
-            Vector3 rotatedNormal;
-
-            // Apply Y rotation to normal
-            rotatedNormal.assign((normal.x * camCosY + normal.z * camSinY) / FIXED_POINT_SCALE,
-                                normal.y,
-                               (-normal.x * camSinY + normal.z * camCosY) / FIXED_POINT_SCALE);
-            normal = rotatedNormal;
-
-            // Apply X rotation to normal
-            rotatedNormal.assign(normal.x,
-                               (normal.y * camCosX - normal.z * camSinX) / FIXED_POINT_SCALE,
-                               (normal.y * camSinX + normal.z * camCosX) / FIXED_POINT_SCALE);
-            normal = rotatedNormal;
-
-            // Apply Z rotation to normal
-            rotatedNormal.assign((normal.x * camCosZ - normal.y * camSinZ) / FIXED_POINT_SCALE,
-                               (normal.x * camSinZ + normal.y * camCosZ) / FIXED_POINT_SCALE,
-                                normal.z);
-            normal = rotatedNormal;
+            // Transform normal using the same matrix. The previous code
+            // emphasised that the rotation ORDER must match the position
+            // transform and Camera::transformDirection; that requirement
+            // is now baked into the matrix composition above, so this is
+            // literally just the same mat-vec re-applied to the normal.
+            //
+            // Skipped entirely on the object-local-light path: in that
+            // path the normal stays in mesh-local space and is dotted
+            // against the (also mesh-local) light direction below.
+            if (!objectLocalLight) {
+                const int32_t nx = normal.x, ny = normal.y, nz_ = normal.z;
+                normal.assign(
+                    (int32_t)(((int64_t)nx * camM00 + (int64_t)ny * camM01 + (int64_t)nz_ * camM02) / FIXED_POINT_SCALE),
+                    (int32_t)(((int64_t)nx * camM10 + (int64_t)ny * camM11 + (int64_t)nz_ * camM12) / FIXED_POINT_SCALE),
+                    (int32_t)(((int64_t)nx * camM20 + (int64_t)ny * camM21 + (int64_t)nz_ * camM22) / FIXED_POINT_SCALE));
+            }
 #endif
         }
 
@@ -728,6 +910,17 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
 #if LIGHTING
         // Store transformed normal (only consumed by the lit shading paths).
         vertex.normal.assign(normal);
+        // Object-local-light path: precompute the per-vertex Lambert
+        // brightness here using the mesh-local normal + object-local
+        // light direction. drawTriangle reads this back and skips its
+        // own jetShadeBrightness call. For FLAT triangles all three
+        // verts of a face share the same normal (computeFlatNormals
+        // stamps identical normals) so the per-triangle FLAT path can
+        // pick any one — it uses v1 already.
+        if (objectLocalLight) {
+            vertex.lambertBrightness = sceneLambertDiffuse(
+                normal, objLightDir, objLightIntensity, objDiffuseCoef);
+        }
 #endif
     }
 
@@ -766,7 +959,8 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // cam.x can be in the thousands after clipping).
     auto projectVertex = [&](const Vector3& cam,
                              const Vector3& normalCamSpace,
-                             const Vector2& uv) -> Object::Vertex {
+                             const Vector2& uv,
+                             uint16_t lambertBrightness = 0) -> Object::Vertex {
         Object::Vertex v;
         int64_t denom = (int64_t)cam.z * FIXED_POINT_SCALE;
         if (denom == 0) denom = 1;
@@ -775,6 +969,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         v.position.z = cam.z;
         v.normal = normalCamSpace;
         v.uv = uv;
+        v.lambertBrightness = lambertBrightness;
         return v;
     };
 
@@ -792,12 +987,23 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         Vector3 n(lerpI32(A.normal.x, B.normal.x, t),
                   lerpI32(A.normal.y, B.normal.y, t),
                   lerpI32(A.normal.z, B.normal.z, t));
+        // Interpolate the precomputed Lambert brightness along the clipped
+        // edge too. Without this, clipped vertices land in projectVertex
+        // with the default lambertBrightness=0 and the brightnessPrecomputed
+        // path downstream reads pure black — for FLAT that turns the whole
+        // face black whenever v1 happens to be the clipped vertex; for
+        // GOURAUD it gradient-blends toward black at the clip seam,
+        // producing the dark wedge artefacts visible on triangles whose
+        // vertices straddle the near plane.
+        const uint16_t lb = (uint16_t)(A.lambertBrightness +
+            (int32_t)(((int64_t)t * (int32_t)(B.lambertBrightness - A.lambertBrightness)) / FIXED_POINT_SCALE));
 #else
         Vector3 n(0, 0, 0);
+        const uint16_t lb = 0;
 #endif
         Vector2 uv(lerpI32(A.uv.x, B.uv.x, t),
                    lerpI32(A.uv.y, B.uv.y, t));
-        return projectVertex(camNew, n, uv);
+        return projectVertex(camNew, n, uv, lb);
     };
 
     // Emit a projected triangle into renderQueue (does screen-bounds + backface
@@ -857,6 +1063,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         rt.zBias          = obj->zBias;
         rt.objAlpha       = objAlpha;
         rt.avgZ           = avgZ;
+#if LIGHTING
+        rt.brightnessPrecomputed = objectLocalLight;
+#endif
 #if MAX_PICK_QUERIES > 0
         rt.sourceObject        = obj;
         rt.sourceTriangleIndex = srcTriIdx;

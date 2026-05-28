@@ -96,32 +96,56 @@ namespace Primitives
         int32_t hh = height / 2;
         int32_t hd = depth / 2;
 
-                        //x,y,z,u,v,nx,ny,nz
-        // Define the 8 unique vertices for the cube
-        cube->addVertex({{-hw, -hh, hd}, {0, 0}, {0, 0, FIXED_POINT_SCALE}});   // v0 - Front bottom left
-        cube->addVertex({{hw, -hh, hd}, {FIXED_POINT_SCALE, 0}, {0, 0, FIXED_POINT_SCALE}});    // v1 - Front bottom right
-        cube->addVertex({{hw, hh, hd}, {FIXED_POINT_SCALE, FIXED_POINT_SCALE}, {0, 0, FIXED_POINT_SCALE}});     // v2 - Front top right
-        cube->addVertex({{-hw, hh, hd}, {0, FIXED_POINT_SCALE}, {0, 0, FIXED_POINT_SCALE}});    // v3 - Front top left
-        cube->addVertex({{-hw, -hh, -hd}, {0, 0}, {0, 0, -FIXED_POINT_SCALE}}); // v4 - Back bottom left
-        cube->addVertex({{hw, -hh, -hd}, {FIXED_POINT_SCALE, 0}, {0, 0, -FIXED_POINT_SCALE}});  // v5 - Back bottom right
-        cube->addVertex({{hw, hh, -hd}, {FIXED_POINT_SCALE, FIXED_POINT_SCALE}, {0, 0, -FIXED_POINT_SCALE}});   // v6 - Back top right
-        cube->addVertex({{-hw, hh, -hd}, {0, FIXED_POINT_SCALE}, {0, 0, -FIXED_POINT_SCALE}});  // v7 - Back top left
+        // 24 verts: 4 per face, each carrying its own face normal. The
+        // previous 8-vertex layout shared corners across 6 faces but only
+        // stamped a ±Z normal on each, leaving 4 of 6 faces with garbage
+        // normals (rendered as ambient-only under LIGHTING).
+        const int32_t N = FIXED_POINT_SCALE;
 
-        // Create unique materials for each face with different colors
-        Material *frontMaterial = new Material(0xF800, nullptr, nullptr, false);  // Red in 16-bit RGB565
-        Material *backMaterial = new Material(0x07E0, nullptr, nullptr, false);   // Green in 16-bit RGB565
-        Material *leftMaterial = new Material(0x001F, nullptr, nullptr, false);   // Blue in 16-bit RGB565
-        Material *rightMaterial = new Material(0xFFE0, nullptr, nullptr, false);  // Yellow in 16-bit RGB565
-        Material *topMaterial = new Material(0xF81F, nullptr, nullptr, false);    // Magenta in 16-bit RGB565
-        Material *bottomMaterial = new Material(0x07FF, nullptr, nullptr, false); // Cyan in 16-bit RGB565
+        // Front (+Z)
+        cube->addVertex({{-hw, -hh,  hd}, {0, 0}, {0, 0,  N}});
+        cube->addVertex({{ hw, -hh,  hd}, {0, 0}, {0, 0,  N}});
+        cube->addVertex({{ hw,  hh,  hd}, {0, 0}, {0, 0,  N}});
+        cube->addVertex({{-hw,  hh,  hd}, {0, 0}, {0, 0,  N}});
+        // Back (-Z)
+        cube->addVertex({{ hw, -hh, -hd}, {0, 0}, {0, 0, -N}});
+        cube->addVertex({{-hw, -hh, -hd}, {0, 0}, {0, 0, -N}});
+        cube->addVertex({{-hw,  hh, -hd}, {0, 0}, {0, 0, -N}});
+        cube->addVertex({{ hw,  hh, -hd}, {0, 0}, {0, 0, -N}});
+        // Left (-X)
+        cube->addVertex({{-hw, -hh, -hd}, {0, 0}, {-N, 0, 0}});
+        cube->addVertex({{-hw, -hh,  hd}, {0, 0}, {-N, 0, 0}});
+        cube->addVertex({{-hw,  hh,  hd}, {0, 0}, {-N, 0, 0}});
+        cube->addVertex({{-hw,  hh, -hd}, {0, 0}, {-N, 0, 0}});
+        // Right (+X)
+        cube->addVertex({{ hw, -hh,  hd}, {0, 0}, { N, 0, 0}});
+        cube->addVertex({{ hw, -hh, -hd}, {0, 0}, { N, 0, 0}});
+        cube->addVertex({{ hw,  hh, -hd}, {0, 0}, { N, 0, 0}});
+        cube->addVertex({{ hw,  hh,  hd}, {0, 0}, { N, 0, 0}});
+        // Top (+Y)
+        cube->addVertex({{-hw,  hh,  hd}, {0, 0}, {0,  N, 0}});
+        cube->addVertex({{ hw,  hh,  hd}, {0, 0}, {0,  N, 0}});
+        cube->addVertex({{ hw,  hh, -hd}, {0, 0}, {0,  N, 0}});
+        cube->addVertex({{-hw,  hh, -hd}, {0, 0}, {0,  N, 0}});
+        // Bottom (-Y)
+        cube->addVertex({{-hw, -hh, -hd}, {0, 0}, {0, -N, 0}});
+        cube->addVertex({{ hw, -hh, -hd}, {0, 0}, {0, -N, 0}});
+        cube->addVertex({{ hw, -hh,  hd}, {0, 0}, {0, -N, 0}});
+        cube->addVertex({{-hw, -hh,  hd}, {0, 0}, {0, -N, 0}});
 
-        // Define faces for the cube using the new addFace method with unique materials
-        cube->addFace(0, 1, 2, 3, frontMaterial);  // Front face
-        cube->addFace(5, 4, 7, 6, backMaterial);   // Back face
-        cube->addFace(4, 0, 3, 7, leftMaterial);   // Left face
-        cube->addFace(1, 5, 6, 2, rightMaterial);  // Right face
-        cube->addFace(3, 2, 6, 7, topMaterial);    // Top face
-        cube->addFace(4, 5, 1, 0, bottomMaterial); // Bottom face
+        Material *frontMaterial  = new Material(0xF800, nullptr, nullptr, false); // Red
+        Material *backMaterial   = new Material(0x07E0, nullptr, nullptr, false); // Green
+        Material *leftMaterial   = new Material(0x001F, nullptr, nullptr, false); // Blue
+        Material *rightMaterial  = new Material(0xFFE0, nullptr, nullptr, false); // Yellow
+        Material *topMaterial    = new Material(0xF81F, nullptr, nullptr, false); // Magenta
+        Material *bottomMaterial = new Material(0x07FF, nullptr, nullptr, false); // Cyan
+
+        cube->addFace( 0,  1,  2,  3, frontMaterial);
+        cube->addFace( 4,  5,  6,  7, backMaterial);
+        cube->addFace( 8,  9, 10, 11, leftMaterial);
+        cube->addFace(12, 13, 14, 15, rightMaterial);
+        cube->addFace(16, 17, 18, 19, topMaterial);
+        cube->addFace(20, 21, 22, 23, bottomMaterial);
 
         cube->calculateBoundingBox();
 
@@ -210,46 +234,42 @@ namespace Primitives
         Object *pyramid = new Object();
 
         int32_t halfBase = baseSize / 2;
+        const int32_t N = FIXED_POINT_SCALE;
 
-        // Base vertices (lying on the XZ plane at Y = 0)
-        pyramid->addVertex({{-halfBase, 0, -halfBase}, {0, 0}, {0, 0, 0}});                              // v0
-        pyramid->addVertex({{halfBase, 0, -halfBase}, {FIXED_POINT_SCALE, 0}, {0, 0, 0}});                // v1
-        pyramid->addVertex({{halfBase, 0, halfBase}, {FIXED_POINT_SCALE, FIXED_POINT_SCALE}, {0, 0, 0}}); // v2
-        pyramid->addVertex({{-halfBase, 0, halfBase}, {0, FIXED_POINT_SCALE}, {0, 0, 0}});               // v3
-
+        // 4 base verts + 4 sides × 3 verts = 16 verts. Per-face vertex
+        // ownership avoids the destructive shared-vertex normal stamping
+        // the previous implementation had: it used 5 shared verts and
+        // overwrote each base corner's downward normal with whichever
+        // side face happened to reference it last, leaving the base
+        // tris with garbage normals and the apex with no normal at all.
         Vector2 apexUV = {FIXED_POINT_SCALE / 2, FIXED_POINT_SCALE / 2};
-        pyramid->addVertex({{0, height, 0}, apexUV, {0, 0, 0}}); // v4
 
-        // Set normals for the base face (pointing downwards along the Y-axis)
-        for (int i = 0; i < 4; ++i)
-        {
-            pyramid->vertices[i].normal.assign(0, -FIXED_POINT_SCALE, 0);
-        }
-
-        // Base face triangles
+        // Base (-Y), CCW from below so the normal points down.
+        pyramid->addVertex({{-halfBase, 0, -halfBase}, {0, 0},                                       {0, -N, 0}});
+        pyramid->addVertex({{ halfBase, 0,  halfBase}, {FIXED_POINT_SCALE, FIXED_POINT_SCALE},       {0, -N, 0}});
+        pyramid->addVertex({{ halfBase, 0, -halfBase}, {FIXED_POINT_SCALE, 0},                       {0, -N, 0}});
+        pyramid->addVertex({{-halfBase, 0,  halfBase}, {0, FIXED_POINT_SCALE},                       {0, -N, 0}});
         pyramid->addTriangle(0, 1, 2, material);
-        pyramid->addTriangle(0, 2, 3, material);
+        pyramid->addTriangle(0, 3, 1, material);
 
-        // Side faces
-        // Each side shares the apex vertex and two base vertices
-        // We'll compute normals for each face and assign them to the corresponding vertices
+        // Four side faces. Each gets its own three verts so the apex can
+        // hold per-side normals — `computeFlatNormals` then assigns the
+        // real cross-product face normal to all three.
+        auto addSide = [&](int32_t x0, int32_t z0, int32_t x1, int32_t z1) {
+            uint16_t b = (uint16_t)pyramid->vertices.size();
+            pyramid->addVertex({{x0, 0, z0},         {0, 0},                                 {0, 0, 0}});
+            pyramid->addVertex({{x1, 0, z1},         {FIXED_POINT_SCALE, 0},                 {0, 0, 0}});
+            pyramid->addVertex({{ 0, height, 0},     apexUV,                                 {0, 0, 0}});
+            pyramid->addTriangle(b, b + 1, b + 2, material);
+        };
+        // Wind each side CCW viewed from outside so outward normals win
+        // backface culling.
+        addSide(-halfBase, -halfBase,  halfBase, -halfBase); // front (-Z)
+        addSide( halfBase, -halfBase,  halfBase,  halfBase); // right (+X)
+        addSide( halfBase,  halfBase, -halfBase,  halfBase); // back (+Z)
+        addSide(-halfBase,  halfBase, -halfBase, -halfBase); // left (-X)
 
-        // Side 1 (v0, v1, v4)
-        computeNormal(pyramid, 0, 1, 4);
-        pyramid->addTriangle(0, 1, 4, material);
-
-        // Side 2 (v1, v2, v4)
-        computeNormal(pyramid, 1, 2, 4);
-        pyramid->addTriangle(1, 2, 4, material);
-
-        // Side 3 (v2, v3, v4)
-        computeNormal(pyramid, 2, 3, 4);
-        pyramid->addTriangle(2, 3, 4, material);
-
-        // Side 4 (v3, v0, v4)
-        computeNormal(pyramid, 3, 0, 4);
-        pyramid->addTriangle(3, 0, 4, material);
-
+        pyramid->computeFlatNormals();
         pyramid->calculateBoundingBox();
 
         return pyramid;
@@ -618,10 +638,10 @@ namespace Primitives
         uint16_t maxU = FIXED_POINT_SCALE;
         uint16_t maxV = FIXED_POINT_SCALE;
 
-        quad->addVertex({{-hw, -hh, 0}, {0, 0}, {0, 0, 0}}); // v0
-        quad->addVertex({{hw, -hh, 0}, {maxU, 0}, {0, 0, 0}});  // v1
-        quad->addVertex({{hw, hh, 0}, {maxU, maxV}, {0, 0, 0}});   // v2
-        quad->addVertex({{-hw, hh, 0}, {0, maxV}, {0, 0, 0}});  // v3
+        quad->addVertex({{-hw, -hh, 0}, {0, 0},       {0, 0, FIXED_POINT_SCALE}}); // v0
+        quad->addVertex({{ hw, -hh, 0}, {maxU, 0},    {0, 0, FIXED_POINT_SCALE}}); // v1
+        quad->addVertex({{ hw,  hh, 0}, {maxU, maxV}, {0, 0, FIXED_POINT_SCALE}}); // v2
+        quad->addVertex({{-hw,  hh, 0}, {0, maxV},    {0, 0, FIXED_POINT_SCALE}}); // v3
 
         // Define two triangles
         quad->addTriangle(0, 1, 2, material);

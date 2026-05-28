@@ -51,6 +51,7 @@ class Rasterizer
         Camera *camera;                 ///< Camera supplying view/projection state.
         bool interlacedMode = false;    ///< When true, only every other row is drawn each frame.
         bool checkerboardMode = false;  ///< When true, alternates between two complementary checkerboard pixel patterns each frame. Requires double-buffering in the frontend for the reconstruction pass.
+        bool wireframeMode = false;     ///< When true, triangles are drawn as outlines (in their material colour) instead of being filled. Skips lighting, texturing and the z-buffer; intended as a debug/visualisation aid. Scene::clearBuffers forces a black background while this is on.
         int randomSeed = 255;           ///< Seed for the screen-door / dither random source.
 
         /// @name Distance-based texture LOD
@@ -98,7 +99,7 @@ class Rasterizer
         /// @param zBias Per-triangle depth bias in z-buffer units.
         /// @param objAlpha Per-object alpha multiplier (255 = no fade).
         /// @return True if the triangle produced any rasterizer work.
-        bool drawTriangle(const Object::Vertex &v1, const Object::Vertex &v2, const Object::Vertex &v3, Material *material, DirectionalLight *directionalLight, AmbientLight *ambientLight, bool renderEvenLines, bool ignoreZBuffer, bool noWriteZBuffer, int zBias, uint8_t objAlpha = 255);
+        bool drawTriangle(const Object::Vertex &v1, const Object::Vertex &v2, const Object::Vertex &v3, Material *material, DirectionalLight *directionalLight, AmbientLight *ambientLight, bool renderEvenLines, bool ignoreZBuffer, bool noWriteZBuffer, int zBias, uint8_t objAlpha = 255, bool brightnessPrecomputed = false);
 
         /// @brief Map an 8-bit grayscale value to RGB565.
         /// @param grayscale 8-bit luminance.

@@ -41,6 +41,14 @@ public:
         Vector2 uv = {0,0};         ///< Texture coordinates.
         Vector3 normal = {0,0,0};   ///< Normal vector.
         uint16_t color = 0x0000;    ///< Per-vertex colour (RGB565).
+        /// @brief Precomputed Lambert+ambient-clipped brightness in
+        /// [0..255+specular]. Populated by Scene.cpp ONLY for objects
+        /// whose materials are all non-specular; the rasterizer's per-
+        /// triangle flag `brightnessPrecomputed` selects between this
+        /// cached value and re-computing from `normal` + `lightDir`.
+        /// Skipping the per-vertex view-space normal transform is the
+        /// whole point of the precompute path.
+        uint16_t lambertBrightness = 0;
     };
 
     std::vector<Vertex> vertices;       ///< Mesh vertices.
@@ -147,6 +155,24 @@ public:
     /// @param v4 Fourth vertex index.
     /// @param material Material applied to both triangles.
     void addFace(uint16_t v1, uint16_t v2, uint16_t v3, uint16_t v4, Material* material);
+
+    /// @brief Compute and assign flat (per-face) normals for every triangle.
+    ///
+    /// For each triangle, computes the cross-product face normal of its
+    /// position vectors, normalises to `FIXED_POINT_SCALE` magnitude, and
+    /// writes that normal into all three vertex slots the triangle
+    /// references. Procedural geometry (boxes, cliffs, trees) built via
+    /// `addTriangle`/`addFace` should call this once after the mesh is
+    /// complete so the renderer's directional lighting has real normals to
+    /// shade against — without this every triangle's `N·L` is zero and the
+    /// surface receives only the ambient term.
+    ///
+    /// NOTE: When vertices are shared between triangles with different
+    /// orientations this is destructive (the last triangle wins). Callers
+    /// that need smooth shading should either author per-face vertices
+    /// (the convention in the scene helpers) or supply explicit normals
+    /// via the OBJ loader instead.
+    void computeFlatNormals();
 
     /// @brief Set the world-space position.
     /// @param x World X.

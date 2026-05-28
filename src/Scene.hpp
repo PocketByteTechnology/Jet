@@ -162,6 +162,12 @@ private:
         // Per-object alpha multiplier (255 = no per-object fade); folded
         // into the per-pixel screen-door alpha at raster time.
         uint8_t objAlpha;
+        // When true, v1/v2/v3.lambertBrightness has been precomputed in
+        // object-local space by renderObject (see "objectLocalLight" path
+        // in Scene.cpp). drawTriangle skips its own jetShadeBrightness
+        // calls in that case and reads the cached values directly. Only
+        // ever set for objects whose materials are all non-specular.
+        bool brightnessPrecomputed = false;
 #if MAX_PICK_QUERIES > 0
         // Source object + ORIGINAL triangle index (in obj->triangles) for
         // pick attribution. Carried through the painter sort.
