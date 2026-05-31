@@ -54,6 +54,15 @@ class Rasterizer
         bool wireframeMode = false;     ///< When true, triangles are drawn as outlines (in their material colour) instead of being filled. Skips lighting, texturing and the z-buffer; intended as a debug/visualisation aid. Scene::clearBuffers forces a black background while this is on.
         int randomSeed = 255;           ///< Seed for the screen-door / dither random source.
 
+        /// @brief Y-band clip for partial-screen rendering (band / parallel passes).
+        ///
+        /// Only rows in [yBandMin, yBandMax) are rasterised. Defaults cover the
+        /// full screen so existing callers need no changes. Set both fields before
+        /// calling drawTriangle(), or use Scene::rasterizeBand() which manages
+        /// them automatically via a thread-local copy of the rasteriser.
+        int yBandMin = 0;           ///< First row (inclusive) to rasterise. 0 = top of screen.
+        int yBandMax = 0x7FFFFFFF;  ///< First row (exclusive) NOT to rasterise. 0x7FFFFFFF = full height.
+
         /// @name Distance-based texture LOD
         /// @brief Beyond `textureLodFar`, textured triangles drop their texture
         /// and render as flat `material->color`, taking the fast simple-span

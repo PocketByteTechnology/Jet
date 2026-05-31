@@ -23,13 +23,13 @@ public:
     #else
     Vector3 rotation = {0,0,0};
     #endif
-    int32_t fov;                ///< Field of view in degrees.
+    float   fov;                ///< Field of view in degrees.
     int32_t nearPlane = 128;    ///< Near clip distance. Values below 128 can degrade perspective-correct texture mapping.
     int32_t farPlane = 1024;    ///< Far clip distance.
 
-    int32_t halfFOV;            ///< Cached half-FOV in degrees (set by setFOV).
-    int32_t tanHalfFOV;         ///< Cached tan(halfFOV) in fixed point (set by setFOV).
-    int32_t fovFactor;          ///< Cached projection scale factor (set by setFOV).
+    int32_t halfFOV;            ///< Cached half-FOV in degrees (integer setFOV path only).
+    int32_t tanHalfFOV;         ///< Cached tan(halfFOV) fixed-point (integer setFOV path only).
+    float   fovFactor;          ///< Cached projection scale factor: (screenWidth/2) / tan(fov/2 radians).
 
     /// @brief Construct a camera with a default 60 degree FOV.
     Camera();
@@ -112,10 +112,16 @@ public:
     /// @param translation Translation vector.
     void translateLocalY(Vector3 translation);
 
-    /// @brief Set the FOV and recompute cached projection factors.
-    /// @param fovDegrees Vertical field of view in degrees.
+    /// @brief Set the FOV and recompute cached projection factors (integer degrees).
+    /// @param fovDegrees Vertical field of view in whole degrees.
     /// @param screenWidth Output width in pixels (used to derive fovFactor).
     void setFOV(int32_t fovDegrees, int32_t screenWidth);
+
+    /// @brief Set the FOV and recompute cached projection factors (sub-degree precision).
+    /// Uses tanf() instead of the integer LUT for smooth animated FOV transitions.
+    /// @param fovDegrees Vertical field of view in degrees (may be fractional).
+    /// @param screenWidth Output width in pixels (used to derive fovFactor).
+    void setFOV(float fovDegrees, int32_t screenWidth);
 
     /// @brief Orient the camera so its forward vector points at a target.
     /// @param target World-space point to look at.

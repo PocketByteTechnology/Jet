@@ -51,7 +51,7 @@ bool Scene::cullObject(Object* obj,
     const Vector3& bMax = obj->boundingBoxMax;
 
     int outLeft = 0, outRight = 0, outTop = 0, outBottom = 0, outNear = 0, outFar = 0;
-    int32_t fovFactor = camera->fovFactor;
+    float   fovFactor = camera->fovFactor;
     int32_t nearPlane = camera->nearPlane;
     int32_t farPlane  = camera->farPlane;
 
@@ -96,8 +96,9 @@ bool Scene::cullObject(Object* obj,
         if (p.z > farPlane)  { outFar++;  continue; }
         if (p.z <= 0)        { outNear++; continue; }
 
-        int32_t sx = (p.x * fovFactor) / (p.z * FIXED_POINT_SCALE) + screenWidth / 2;
-        int32_t sy = screenHeight / 2 - (p.y * fovFactor) / (p.z * FIXED_POINT_SCALE);
+        const float invZ = fovFactor / (float)p.z;
+        int32_t sx = (int32_t)(p.x * invZ) + screenWidth / 2;
+        int32_t sy = screenHeight / 2 - (int32_t)(p.y * invZ);
         if (sx < 0)            outLeft++;
         if (sx > screenWidth)  outRight++;
         if (sy < 0)            outTop++;
@@ -225,6 +226,34 @@ void Scene::reconstructCheckerboard() {
     }
 }
 
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+// clearBuffers() row fill using 128-bit EE.VST.128.XP stores (4 × uint32
+// per instruction). dest must be 16-byte aligned; n32 need not be a
+// multiple of 4 — trailing elements are handled with scalar stores.
+static void jet_fill_u32x16(uint32_t* dest, uint32_t val, int n32) {
+    const int n16 = n32 >> 2;
+    if (n16 > 0) {
+        __asm__ volatile (
+            "ee.movi.32.q q0, %[v], 0\n\t"
+            "ee.movi.32.q q0, %[v], 1\n\t"
+            "ee.movi.32.q q0, %[v], 2\n\t"
+            "ee.movi.32.q q0, %[v], 3\n\t"
+            : : [v] "r"(val)
+        );
+        // EE.VST.128.XP takes the post-increment stride as a register,
+        // not a bare immediate: as += stride_reg after each 128-bit store.
+        const int stride = 16;
+        for (int i = 0; i < n16; i++) {
+            __asm__ volatile (
+                "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                : [p] "+r"(dest) : [s] "r"(stride) : "memory"
+            );
+        }
+    }
+    for (int r = n32 & 3; r-- > 0; ) *dest++ = val;
+}
+#endif
+
 void PERF_CRITICAL Scene::clearBuffers() {
     //cast the framebuffer to a 32-bit pointer
     uint32_t* framebuffer32 = (uint32_t*)framebuffer;
@@ -285,9 +314,13 @@ void PERF_CRITICAL Scene::clearBuffers() {
                 #else
                 uint32_t* lineStart = framebuffer32 + y * (screenWidth / divisor);
                 #endif
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+                jet_fill_u32x16(lineStart, lineColor32, screenWidth / divisor);
+#else
                 for (int x = 0; x < screenWidth / divisor; x++) {
                     lineStart[x] = lineColor32;
                 }
+#endif
                 #if Z_BUFFERING
                 #if HALF_WIDTH_BUFFERS
                 memset(zBuffer + (y / 2) * (screenWidth / 2), 0xFF, (screenWidth / 2) * sizeof(uint16_t));
@@ -312,7 +345,12 @@ void PERF_CRITICAL Scene::clearBuffers() {
             const int rowCount  = screenHeight;
             #endif
             const int row32     = rowPixels / 2; // pairs of pixels per row
-            for (int y = 0; y < rowCount; ++y) {
+            // Respect yBandMin/yBandMax so the clear only touches the rows
+            // assigned to this band (critical for virtual-base-pointer band
+            // rendering where the buffer only covers [yBandMin, yBandMax)).
+            const int yClearStart = renderer ? renderer->yBandMin             : 0;
+            const int yClearEnd   = renderer ? std::min(renderer->yBandMax, rowCount) : rowCount;
+            for (int y = yClearStart; y < yClearEnd; ++y) {
                 #if DEBUG_OVERDRAW
                 const uint16_t lineColor = 0;
                 #else
@@ -327,7 +365,11 @@ void PERF_CRITICAL Scene::clearBuffers() {
                 #endif
                 const uint32_t lineColor32 = ((uint32_t)lineColor << 16) | lineColor;
                 uint32_t* lineStart = framebuffer32 + y * row32;
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+                jet_fill_u32x16(lineStart, lineColor32, row32);
+#else
                 for (int x = 0; x < row32; ++x) lineStart[x] = lineColor32;
+#endif
             }
             #if Z_BUFFERING
             // Z-buffer stride matches the rasterizer's depth-buffer layout
@@ -352,7 +394,7 @@ void PERF_CRITICAL Scene::clearBuffers() {
     }
 }
 
-void Scene::render() {
+void Scene::prepareFrame() {
     if (!camera) return;
     // renderEvenLines drives the frame-parity selection used by both interlaced
     // and checkerboard modes.  In interlaced mode it selects which rows to draw;
@@ -406,10 +448,31 @@ void Scene::render() {
 
     for (auto obj : objects) {
         if (!obj->enabled) continue;
-        // 1) Object-level AABB frustum cull
+        // 1) Quick sphere far-cull before the expensive 8-corner AABB test.
+        //    distSq to the object centre is computed unconditionally so it
+        //    is also available for the fade ramps and LOD pick below,
+        //    replacing the old lazy-compute block. The conservative sphere
+        //    radius used is the object's longest bounding-box dimension
+        //    (always >= the true bounding-sphere radius — never drops a
+        //    visible object).
+        uint8_t objAlpha = 255;
+        const int32_t _ocx = (obj->position.x + obj->centreVolume.x) - camera->position.x;
+        const int32_t _ocy = (obj->position.y + obj->centreVolume.y) - camera->position.y;
+        const int32_t _ocz = (obj->position.z + obj->centreVolume.z) - camera->position.z;
+        int64_t distSq = (int64_t)_ocx*_ocx + (int64_t)_ocy*_ocy + (int64_t)_ocz*_ocz;
+        int32_t dist   = -1;
+        {
+            const int32_t maxExtent = std::max({
+                obj->boundingBoxMax.x - obj->boundingBoxMin.x,
+                obj->boundingBoxMax.y - obj->boundingBoxMin.y,
+                obj->boundingBoxMax.z - obj->boundingBoxMin.z});
+            const int64_t farCutoff = static_cast<int64_t>(camera->farPlane) + maxExtent;
+            if (distSq > farCutoff * farCutoff) continue;
+        }
+        // 2) Object-level AABB frustum cull (all 8 corners; full rotation).
         if (cullObject(obj, camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ))
             continue;
-        // 1b) Per-object distance fade (two ramps, multiplied):
+        // 3) Per-object distance fade (two ramps, multiplied):
         //     - fadeFar > 0:   close=opaque, far=invisible (decor fade-out).
         //     - appearFar > 0: close=invisible, far=opaque (LOD impostor
         //                      that pops in at distance).
@@ -421,23 +484,7 @@ void Scene::render() {
         //     OR closer than appearNear the object is skipped entirely
         //     (no transform, no per-tri work), so this is a real perf
         //     win not just a visual fade.
-        uint8_t objAlpha = 255;
-        // Distance to object centre. Computed lazily and shared between
-        // the fade ramps and the LOD pick below; both want the same
-        // value, so we never sqrt() twice.
-        int64_t distSq = -1;
-        int32_t dist   = -1;
-        const bool needsDist = (obj->fadeFar > 0)
-                            || (obj->appearFar > 0)
-                            || (lodScale > 0);
-        if (needsDist) {
-            const int32_t dx = (obj->position.x + obj->centreVolume.x) - camera->position.x;
-            const int32_t dy = (obj->position.y + obj->centreVolume.y) - camera->position.y;
-            const int32_t dz = (obj->position.z + obj->centreVolume.z) - camera->position.z;
-            // 64-bit guard: dx/dy/dz can be in the thousands so the
-            // squared sum can overflow int32_t.
-            distSq = (int64_t)dx * dx + (int64_t)dy * dy + (int64_t)dz * dz;
-        }
+        // distSq is always valid here (computed above for the sphere pre-cull).
         if (obj->fadeFar > 0 || obj->appearFar > 0) {
             if (obj->fadeFar > 0) {
                 const int64_t farSq = (int64_t)obj->fadeFar * obj->fadeFar;
@@ -525,19 +572,64 @@ void Scene::render() {
     // *over* geometry that's genuinely much closer (where avgZ differences
     // are thousands). Tune if the scale of the world changes significantly.
     constexpr int32_t zBiasScale = 256;
-    std::sort(renderQueue.begin(), renderQueue.end(),
-        [zBiasScale](const RenderTri& a, const RenderTri& b) {
-            auto band = [](const RenderTri& t) {
-                if (t.noWriteZBuffer) return 0;
-                if (t.ignoreZBuffer)  return 2;
-                return 1;
-            };
-            const int ba = band(a), bb = band(b);
-            if (ba != bb) return ba < bb;
-            const int32_t ka = a.avgZ - (int32_t)a.zBias * zBiasScale;
-            const int32_t kb = b.avgZ - (int32_t)b.zBias * zBiasScale;
-            return ka > kb; // farther first within a band
-        });
+    // Bucket sort: O(N) vs O(N log N) for std::sort. Separates the three
+    // draw bands with one linear pass, then counting-sorts the normal band
+    // by depth in K=64 buckets (farther triangles first). Within a bucket
+    // (~Z_RANGE/64 depth units) relative order is preserved (stable).
+    {
+        const int N = static_cast<int>(renderQueue.size());
+        if (N > 1) {
+            const int32_t nearZ  = camera->nearPlane;
+            const int32_t farZ   = camera->farPlane;
+            const int32_t zRange = (farZ > nearZ) ? (farZ - nearZ) : 1;
+            constexpr int K = 64;
+            int counts[K] = {};
+            int band0N = 0, band2N = 0;
+            // Pass 1: classify bands; histogram the normal band by depth.
+            for (const auto& t : renderQueue) {
+                if (t.noWriteZBuffer) { band0N++; continue; }
+                if (t.ignoreZBuffer)  { band2N++; continue; }
+                const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * zBiasScale;
+                int b = static_cast<int>((static_cast<int64_t>(key - nearZ) * K) / zRange);
+                if (b < 0) b = 0; else if (b >= K) b = K - 1;
+                ++counts[b];
+            }
+            // Prefix sums — output bucket K-1 first (farthest first).
+            int pos[K];
+            pos[K - 1] = band0N;
+            for (int i = K - 2; i >= 0; --i) pos[i] = pos[i + 1] + counts[i + 1];
+            // Pass 2: scatter into reused static output buffer.
+            static std::vector<RenderTri> sortBuffer;
+            sortBuffer.resize(N);
+            int b0 = 0;
+            int b2 = band0N + (N - band0N - band2N);
+            for (const auto& t : renderQueue) {
+                if (t.noWriteZBuffer) { sortBuffer[b0++] = t; continue; }
+                if (t.ignoreZBuffer)  { sortBuffer[b2++] = t; continue; }
+                const int32_t key = t.avgZ - static_cast<int32_t>(t.zBias) * zBiasScale;
+                int b = static_cast<int>((static_cast<int64_t>(key - nearZ) * K) / zRange);
+                if (b < 0) b = 0; else if (b >= K) b = K - 1;
+                sortBuffer[pos[b]++] = t;
+            }
+            renderQueue.swap(sortBuffer);
+        }
+    }
+}  // end prepareFrame()
+
+void Scene::clearBand(int yMin, int yMax) {
+    if (!renderer) return;
+    renderer->yBandMin = yMin;
+    renderer->yBandMax = yMax;
+    clearBuffers();
+}
+
+void Scene::rasterizeBand(int yMin, int yMax) {
+    // Create a thread-local copy of the rasteriser so each band worker has
+    // its own yBandMin/yBandMax. Only framebuffer/zbuffer ptrs are shared;
+    // writes go to non-overlapping y regions so there is no write race.
+    Rasterizer bandRast = *renderer;
+    bandRast.yBandMin = yMin;
+    bandRast.yBandMax = yMax;
 
     // 4) Flush. Count triangles that actually entered the rasterizer
     // (drawTriangle returned true). Triangles dropped by per-tri checks
@@ -546,10 +638,10 @@ void Scene::render() {
     int rasterized = 0;
     for (const auto& t : renderQueue) {
 #if MAX_PICK_QUERIES > 0
-        renderer->currentPickObject        = t.sourceObject;
-        renderer->currentPickTriangleIndex = t.sourceTriangleIndex;
+        bandRast.currentPickObject        = t.sourceObject;
+        bandRast.currentPickTriangleIndex = t.sourceTriangleIndex;
 #endif
-        if (renderer->drawTriangle(t.v1, t.v2, t.v3, t.material,
+        if (bandRast.drawTriangle(t.v1, t.v2, t.v3, t.material,
                                    directionalLight, ambientLight,
                                    renderEvenLines,
                                    t.ignoreZBuffer, t.noWriteZBuffer,
@@ -559,6 +651,12 @@ void Scene::render() {
         }
     }
     lastFrameRasterizedTriangles = rasterized;
+}
+
+void Scene::render() {
+    if (!camera) return;
+    prepareFrame();
+    rasterizeBand(0, screenHeight);
 
     // Checkerboard reconstruction: fill in opposite-parity pixels from the
     // freshly-rendered current-parity neighbours so PostFX sees a fully-populated
@@ -642,7 +740,7 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     #endif
     Vector3 objPos(obj->position);
 
-    int32_t fovFactor = camera->fovFactor;
+    float   fovFactor = camera->fovFactor;
     bool isBillboard = obj->isBillboard;
     CullingMode cullingMode = obj->cullingMode;
     bool ignoreZBuffer = obj->ignoreZBuffer;
@@ -666,6 +764,13 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     int32_t objM00=FIXED_POINT_SCALE, objM01=0, objM02=0;
     int32_t objM10=0, objM11=FIXED_POINT_SCALE, objM12=0;
     int32_t objM20=0, objM21=0, objM22=FIXED_POINT_SCALE;
+    // Float counterparts pre-divided by FIXED_POINT_SCALE. Per-vertex mat-vecs
+    // use hardware-FPU fmul-add instead of int64_t multiply+shift. Defaults
+    // are identity; vertex loop guards on objHasRotation so they're never
+    // consumed when false.
+    float fObjM00=1.0f, fObjM01=0.0f, fObjM02=0.0f;
+    float fObjM10=0.0f, fObjM11=1.0f, fObjM12=0.0f;
+    float fObjM20=0.0f, fObjM21=0.0f, fObjM22=1.0f;
     if (objHasRotation) {
         const int32_t cx = lookupCosI(obj->rotation.x);
         const int32_t sx = lookupSinI(obj->rotation.x);
@@ -693,6 +798,9 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         objM20 = k20;
         objM21 = k21;
         objM22 = k22;
+        fObjM00=(float)objM00/FIXED_POINT_SCALE; fObjM01=(float)objM01/FIXED_POINT_SCALE; fObjM02=(float)objM02/FIXED_POINT_SCALE;
+        fObjM10=(float)objM10/FIXED_POINT_SCALE; fObjM11=(float)objM11/FIXED_POINT_SCALE; fObjM12=(float)objM12/FIXED_POINT_SCALE;
+        fObjM20=(float)objM20/FIXED_POINT_SCALE; fObjM21=(float)objM21/FIXED_POINT_SCALE; fObjM22=(float)objM22/FIXED_POINT_SCALE;
     }
 
     // Composed camera rotation matrix (Rz * Rx * Ry, since the previous
@@ -729,6 +837,10 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         camM21 = k21;
         camM22 = k22;
     }
+    // Float camera matrix: pre-divided by FIXED_POINT_SCALE once per object.
+    const float fCamM00=(float)camM00/FIXED_POINT_SCALE, fCamM01=(float)camM01/FIXED_POINT_SCALE, fCamM02=(float)camM02/FIXED_POINT_SCALE;
+    const float fCamM10=(float)camM10/FIXED_POINT_SCALE, fCamM11=(float)camM11/FIXED_POINT_SCALE, fCamM12=(float)camM12/FIXED_POINT_SCALE;
+    const float fCamM20=(float)camM20/FIXED_POINT_SCALE, fCamM21=(float)camM21/FIXED_POINT_SCALE, fCamM22=(float)camM22/FIXED_POINT_SCALE;
 
 #if LIGHTING
     // Object-local lighting precompute eligibility.
@@ -835,21 +947,18 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // scale; the divide reduces back to world units. Skipped entirely
         // when the object has identity rotation (true for most scenery).
         if (objHasRotation) {
-            const int32_t px = pos.x, py = pos.y, pz = pos.z;
+            const float fpx = (float)pos.x, fpy = (float)pos.y, fpz = (float)pos.z;
             pos.assign(
-                (int32_t)(((int64_t)px * objM00 + (int64_t)py * objM01 + (int64_t)pz * objM02) / FIXED_POINT_SCALE),
-                (int32_t)(((int64_t)px * objM10 + (int64_t)py * objM11 + (int64_t)pz * objM12) / FIXED_POINT_SCALE),
-                (int32_t)(((int64_t)px * objM20 + (int64_t)py * objM21 + (int64_t)pz * objM22) / FIXED_POINT_SCALE));
+                (int32_t)(fpx * fObjM00 + fpy * fObjM01 + fpz * fObjM02),
+                (int32_t)(fpx * fObjM10 + fpy * fObjM11 + fpz * fObjM12),
+                (int32_t)(fpx * fObjM20 + fpy * fObjM21 + fpz * fObjM22));
 #if LIGHTING
-            // Normal goes through the object matrix only when we need a
-            // view-space normal downstream (specular path). The object-
-            // local-light path leaves normals in their mesh-local frame.
             if (!objectLocalLight) {
-                const int32_t nx = normal.x, ny = normal.y, nz_ = normal.z;
+                const float fnx = (float)normal.x, fny = (float)normal.y, fnz = (float)normal.z;
                 normal.assign(
-                    (int32_t)(((int64_t)nx * objM00 + (int64_t)ny * objM01 + (int64_t)nz_ * objM02) / FIXED_POINT_SCALE),
-                    (int32_t)(((int64_t)nx * objM10 + (int64_t)ny * objM11 + (int64_t)nz_ * objM12) / FIXED_POINT_SCALE),
-                    (int32_t)(((int64_t)nx * objM20 + (int64_t)ny * objM21 + (int64_t)nz_ * objM22) / FIXED_POINT_SCALE));
+                    (int32_t)(fnx * fObjM00 + fny * fObjM01 + fnz * fObjM02),
+                    (int32_t)(fnx * fObjM10 + fny * fObjM11 + fnz * fObjM12),
+                    (int32_t)(fnx * fObjM20 + fny * fObjM21 + fnz * fObjM22));
             }
 #endif
         }
@@ -869,42 +978,32 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
         // per-axis sequence and as Camera::transformDirection so that
         // normals and lightDir continue to share a frame.
         {
-            const int32_t px = pos.x, py = pos.y, pz = pos.z;
+            const float fpx = (float)pos.x, fpy = (float)pos.y, fpz = (float)pos.z;
             pos.assign(
-                (int32_t)(((int64_t)px * camM00 + (int64_t)py * camM01 + (int64_t)pz * camM02) / FIXED_POINT_SCALE),
-                (int32_t)(((int64_t)px * camM10 + (int64_t)py * camM11 + (int64_t)pz * camM12) / FIXED_POINT_SCALE),
-                (int32_t)(((int64_t)px * camM20 + (int64_t)py * camM21 + (int64_t)pz * camM22) / FIXED_POINT_SCALE));
+                (int32_t)(fpx * fCamM00 + fpy * fCamM01 + fpz * fCamM02),
+                (int32_t)(fpx * fCamM10 + fpy * fCamM11 + fpz * fCamM12),
+                (int32_t)(fpx * fCamM20 + fpy * fCamM21 + fpz * fCamM22));
 
 #if LIGHTING
-            // Transform normal using the same matrix. The previous code
-            // emphasised that the rotation ORDER must match the position
-            // transform and Camera::transformDirection; that requirement
-            // is now baked into the matrix composition above, so this is
-            // literally just the same mat-vec re-applied to the normal.
-            //
-            // Skipped entirely on the object-local-light path: in that
-            // path the normal stays in mesh-local space and is dotted
-            // against the (also mesh-local) light direction below.
             if (!objectLocalLight) {
-                const int32_t nx = normal.x, ny = normal.y, nz_ = normal.z;
+                const float fnx = (float)normal.x, fny = (float)normal.y, fnz = (float)normal.z;
                 normal.assign(
-                    (int32_t)(((int64_t)nx * camM00 + (int64_t)ny * camM01 + (int64_t)nz_ * camM02) / FIXED_POINT_SCALE),
-                    (int32_t)(((int64_t)nx * camM10 + (int64_t)ny * camM11 + (int64_t)nz_ * camM12) / FIXED_POINT_SCALE),
-                    (int32_t)(((int64_t)nx * camM20 + (int64_t)ny * camM21 + (int64_t)nz_ * camM22) / FIXED_POINT_SCALE));
+                    (int32_t)(fnx * fCamM00 + fny * fCamM01 + fnz * fCamM02),
+                    (int32_t)(fnx * fCamM10 + fny * fCamM11 + fnz * fCamM12),
+                    (int32_t)(fnx * fCamM20 + fny * fCamM21 + fnz * fCamM22));
             }
 #endif
         }
 
-        // Perspective projection. 64-bit intermediates: cam.x/cam.y can be
-        // in the thousands and fovFactor ≈ 1.6e5, so the 32-bit product would
-        // overflow for anything sitting close to the camera.
+        // Perspective projection — float fovFactor lets us use a reciprocal
+        // multiply instead of 64-bit integer divide, leveraging the hardware
+        // FPU on ESP32-S3/P4 (64-bit div is software-emulated on those cores).
         if (pos.z == 0) pos.z = 1; // avoid divide-by-zero
         // Record camera-space position (pre-projection) for near-plane clipping.
         camSpacePos.push_back(pos);
-        int64_t projDenom = (int64_t)pos.z * FIXED_POINT_SCALE;
-        if (projDenom == 0) projDenom = 1;
-        vertex.position.x = (int32_t)(((int64_t)pos.x * fovFactor) / projDenom) + screenWidth / 2;
-        vertex.position.y = screenHeight / 2 - (int32_t)(((int64_t)pos.y * fovFactor) / projDenom);
+        const float invZ = fovFactor / (float)pos.z;
+        vertex.position.x = (int32_t)(pos.x * invZ) + screenWidth / 2;
+        vertex.position.y = screenHeight / 2 - (int32_t)(pos.y * invZ);
         vertex.position.z = pos.z;
 
 #if LIGHTING
@@ -954,18 +1053,14 @@ void PERF_CRITICAL Scene::renderObject(Object* obj,
     // Given a camera-space position, produce an Object::Vertex with screen-
     // space x/y, camera-space z kept in position.z, and the provided normal
     // and uv (both interpolated upstream in camera / texture space).
-    // Uses 64-bit intermediates because cam.x * fovFactor can overflow
-    // int32_t for vertices generated at the near plane (fovFactor ≈ 1.6e5,
-    // cam.x can be in the thousands after clipping).
     auto projectVertex = [&](const Vector3& cam,
                              const Vector3& normalCamSpace,
                              const Vector2& uv,
                              uint16_t lambertBrightness = 0) -> Object::Vertex {
         Object::Vertex v;
-        int64_t denom = (int64_t)cam.z * FIXED_POINT_SCALE;
-        if (denom == 0) denom = 1;
-        v.position.x = (int32_t)(((int64_t)cam.x * fovFactor) / denom) + screenWidth / 2;
-        v.position.y = screenHeight / 2 - (int32_t)(((int64_t)cam.y * fovFactor) / denom);
+        const float invZ = (cam.z != 0) ? fovFactor / (float)cam.z : 0.0f;
+        v.position.x = (int32_t)(cam.x * invZ) + screenWidth / 2;
+        v.position.y = screenHeight / 2 - (int32_t)(cam.y * invZ);
         v.position.z = cam.z;
         v.normal = normalCamSpace;
         v.uv = uv;

@@ -9,7 +9,7 @@ namespace Renderer
 {
 
     Camera::Camera()
-        : fov(60)
+        : fov(60.0f)
     {
         setFOV(fov, 800); // Initialize cached values
     } // Default FOV to 60 degrees
@@ -287,18 +287,24 @@ namespace Renderer
 
     void Camera::setFOV(int32_t fovDegrees, int32_t screenWidth)
     {
-        fov = fovDegrees;
-
-        // Pre-compute FOV values
-        halfFOV = fov / 2;
-        if (halfFOV >= ANGLE_MAX)
-            halfFOV %= ANGLE_MAX;
+        // Delegate to float overload so both paths share one implementation.
+        setFOV(static_cast<float>(fovDegrees), screenWidth);
+        // Keep legacy integer cached fields in sync for any existing callers.
+        halfFOV = static_cast<int32_t>(fov) / 2;
+        if (halfFOV >= ANGLE_MAX) halfFOV %= ANGLE_MAX;
         tanHalfFOV = lookupTanI(halfFOV);
-        if (tanHalfFOV == 0)
-            tanHalfFOV = 1;
+        if (tanHalfFOV == 0) tanHalfFOV = 1;
+    }
 
-        int64_t numerator = static_cast<int64_t>(screenWidth / 2) * FIXED_POINT_SCALE * FIXED_POINT_SCALE;
-        fovFactor = static_cast<int32_t>(numerator / tanHalfFOV);
+    void Camera::setFOV(float fovDegrees, int32_t screenWidth)
+    {
+        fov = fovDegrees;
+        // half-FOV in radians: fov/2 * pi/180 = fov * pi/360
+        const float halfFovRad = fovDegrees * (static_cast<float>(M_PI) / 360.0f);
+        const float t = tanf(halfFovRad);
+        // fovFactor = (screenWidth/2) / tan(fov/2).
+        // Projection: screenX = pos.x * fovFactor / pos.z + screenWidth/2
+        fovFactor = (t > 0.0f) ? (static_cast<float>(screenWidth / 2) / t) : 1.0f;
     }
 
     void Camera::getRotationMatrix(int32_t& cosX, int32_t& sinX, 

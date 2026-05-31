@@ -70,6 +70,33 @@ public:
     /// @brief Run the full pipeline for one frame: cull, transform, rasterise, post-FX.
     void render();
 
+    /// @brief Phase 1 of split rendering: clear [yBandMin, yBandMax) on the rasteriser,
+    ///        transform and depth-sort all objects. Does NOT rasterise triangles.
+    ///
+    ///        Call this once per frame before any rasterizeBand() calls.
+    ///        The rasteriser's yBandMin/yBandMax gate which rows clearBuffers() clears
+    ///        so the framebuffer pointer can be a virtual base (adjusted for band offset).
+    void prepareFrame();
+
+    /// @brief Phase 2 of split rendering: rasterise the sorted render queue for
+    ///        rows [yMin, yMax) only. Uses a thread-local copy of the rasteriser so
+    ///        concurrent calls with non-overlapping y ranges are safe when Z_BUFFERING==0.
+    ///
+    ///        May be called from multiple threads simultaneously with disjoint bands.
+    void rasterizeBand(int yMin, int yMax);
+
+    /// @brief Clear only the rows [yMin, yMax) of the current framebuffer without
+    ///        re-running the transform or sort pipeline. Use this for bands 1+ when the
+    ///        render queue from the preceding prepareFrame() call is still valid.
+    ///
+    ///        Sets the rasteriser's yBandMin/yBandMax before clearing so the
+    ///        band-aware clear writes only into the correct region.
+    void clearBand(int yMin, int yMax);
+
+    /// @brief Advance the internal frame counter by one. Normally called automatically
+    ///        by render(); use this when driving the pipeline via prepareFrame()/rasterizeBand().
+    void advanceFrameCounter() { frameCounter++; }
+
     /// @brief Get total scene statistics (independent of camera position).
     /// @param objectCount Out: number of enabled objects.
     /// @param triangleCount Out: total triangle count across enabled objects.

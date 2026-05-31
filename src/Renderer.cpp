@@ -355,8 +355,9 @@ namespace Renderer
         // Clamp to screen bounds
         minX = std::max(minX, static_cast<int32_t>(0));
         maxX = std::min(maxX, static_cast<int32_t>(screenWidth - 1));
-        minY = std::max(minY, static_cast<int32_t>(0));
-        maxY = std::min(maxY, static_cast<int32_t>(screenHeight - 1));
+        minY = std::max(minY, static_cast<int32_t>(yBandMin));
+        maxY = std::min(maxY, static_cast<int32_t>(std::min(yBandMax - 1, screenHeight - 1)));
+        if (minY > maxY) return false;
 
 #if LIGHTING
         Vector3 normal = {0, 0, 0};
@@ -496,6 +497,12 @@ namespace Renderer
         int32_t denom = (int32_t)denom64;
         if (denom == 0)
             return false; // Truncation landed on zero; treat as degenerate
+#if LIGHTING
+        // Precompute FPU reciprocal once per triangle. Replaces two int64
+        // __divdi3 calls (per-triangle Gouraud step + per-row brightness
+        // init) with float multiplies — ~70 cy → ~5 cy each on Xtensa LX7.
+        const float invDenom64f = 1.0f / (float)denom64;
+#endif
 
         Vector2 uv = {0, 0};
 #endif
@@ -704,7 +711,7 @@ namespace Renderer
             // pushed denom64 past INT32_MAX (the rasterizer accepts that
             // truncation for per-pixel edge math, but the lighting
             // divides are highly sensitive to denom sign/magnitude).
-            brightness_dx_step_q16 = (int32_t)((bDx << 16) / denom64);
+            brightness_dx_step_q16 = (int32_t)((float)bDx * 65536.0f * invDenom64f);
         }
 #endif
 
@@ -719,7 +726,8 @@ namespace Renderer
                        + (int64_t)dw2_dy * (yStart - v2.position.y);
 
         // Max number of xStep-sized pixel slots in this row.
-        const int64_t iMaxRow = (maxX - minX) / xStep;
+        // Bounded by screenWidth/xStep (≤240) so int32 is sufficient.
+        const int32_t iMaxRow = (maxX - minX) / xStep;
 
         for (int y = yStart; y <= maxY;
              y += inc, w0_row += dw0_dy_step, w1_row += dw1_dy_step, w2_row += dw2_dy_step)
@@ -735,29 +743,51 @@ namespace Renderer
             //   d_j > 0 : ew_j + i*d_j >= 0 iff i >= ceil(-ew_j / d_j)
             //   d_j < 0 : ew_j + i*d_j >= 0 iff i <= floor(ew_j / -d_j)
             //   d_j == 0: ew_j < 0 kills the whole row; else no constraint
-            int64_t iStart = 0;
-            int64_t iEnd   = iMaxRow;
+            //
+            // iStart/iEnd are bounded by iMaxRow (≤240): int32 is fine.
+            // The EW accumulators are int64 (near-camera vertices can push
+            // them out of int32 range), but the skip-check below guarantees
+            // EW fits in int32 by the time we actually divide — so we can
+            // use the Xtensa hardware 32-bit divider instead of the ~70-cycle
+            // soft 64-bit __divdi3/__moddi3 routines.
+            int32_t iStart = 0;
+            int32_t iEnd   = iMaxRow;
             bool skipRow = false;
 
-            #define JET_EDGE_RANGE(EW, D)                                           \
-                do {                                                                  \
-                    if ((D) > 0) {                                                    \
-                        if ((EW) < 0) {                                               \
-                            /* ceil(-EW / D) for positive denominator D. */            \
-                            int64_t num = -(EW);                                      \
-                            int64_t req = (num + (D) - 1) / (D);                      \
-                            if (req > iStart) iStart = req;                           \
-                        }                                                             \
-                    } else if ((D) < 0) {                                             \
-                        if ((EW) < 0) { skipRow = true; }                             \
-                        else {                                                        \
-                            /* floor(EW / -D) for positive divisor (-D). */           \
-                            int64_t req = (EW) / -(int64_t)(D);                       \
-                            if (req < iEnd) iEnd = req;                               \
-                        }                                                             \
-                    } else { /* D == 0 */                                             \
-                        if ((EW) < 0) skipRow = true;                                 \
-                    }                                                                 \
+            // ceil(num/D) > iEnd  iff  num > D*iEnd  (D, iEnd both int32,
+            // product ≤ max_D * 240 which stays well inside int32).
+            // floor(EW/negD) > iEnd  iff  EW > negD*iEnd  (same bounds).
+            // When the skip condition is false, EW (or num) ≤ D*iEnd fits
+            // in int32, so the division below uses 32-bit hardware arithmetic.
+            #define JET_EDGE_RANGE(EW, D)                                                       \
+                do {                                                                              \
+                    if ((D) > 0) {                                                                \
+                        if ((EW) < 0) {                                                           \
+                            int64_t num = -(EW);                                                  \
+                            if (num > (int64_t)(D) * iEnd) {                                      \
+                                /* req > iEnd → row is empty */                                   \
+                                skipRow = true;                                                   \
+                            } else {                                                              \
+                                /* num ≤ D*iEnd: fits in int32, use hw 32-bit divide */           \
+                                int32_t req = ((int32_t)num + (D) - 1) / (D);                    \
+                                if (req > iStart) iStart = req;                                   \
+                            }                                                                     \
+                        }                                                                         \
+                    } else if ((D) < 0) {                                                         \
+                        if ((EW) < 0) { skipRow = true; }                                         \
+                        else {                                                                    \
+                            int32_t negD = -(D);                                                  \
+                            if ((EW) > (int64_t)negD * iEnd) {                                    \
+                                /* floor(EW/negD) > iEnd → no tightening needed, skip divide */  \
+                            } else {                                                              \
+                                /* EW ≤ negD*iEnd: fits in int32, use hw 32-bit divide */         \
+                                int32_t req = (int32_t)(EW) / negD;                               \
+                                if (req < iEnd) iEnd = req;                                       \
+                            }                                                                     \
+                        }                                                                         \
+                    } else { /* D == 0 */                                                         \
+                        if ((EW) < 0) skipRow = true;                                             \
+                    }                                                                             \
                 } while (0)
 
             JET_EDGE_RANGE(w0_row, dw0_dx_step);
@@ -772,8 +802,8 @@ namespace Renderer
             int64_t ew1 = w1_row + (int64_t)dw1_dx_step * iStart;
             int64_t ew2 = w2_row + (int64_t)dw2_dx_step * iStart;
 
-            const int xStart = minX + (int)iStart * xStep;
-            const int xEnd   = minX + (int)iEnd   * xStep;
+            const int xStart = minX + iStart * xStep;
+            const int xEnd   = minX + iEnd   * xStep;
 
             // Wireframe / outline mode. The per-row solver above already
             // gave us the leftmost and rightmost x for this scanline of
@@ -876,7 +906,7 @@ namespace Renderer
                 // See note at brightness_dx_step_q16 setup: divide by
                 // the full-precision int64 denom or super-near triangles
                 // flash dark when denom64 overflows int32.
-                brightness_q16 = (int32_t)((bRowNum << 16) / denom64);
+                brightness_q16 = (int32_t)((float)bRowNum * 65536.0f * invDenom64f);
             }
 #endif
 
