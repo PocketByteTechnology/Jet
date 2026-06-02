@@ -1,7 +1,7 @@
 #include "Scene.hpp"
 #include "TrigLUT.hpp"
 #include "Renderer.hpp"
-#include "Config.hpp"
+#include "JetConfig.hpp"
 #include <cstring> // For memset
 #include <algorithm> // For std::min, std::max
 #include <cmath> // For std::sqrt (per-object distance fade)
@@ -692,7 +692,226 @@ void Scene::render() {
     postFX->applyMotionBlur(framebuffer);
     #endif
 
+    drawSprites();
+
     frameCounter++;
+}
+
+void Scene::addSprite(Sprite2D* sprite) {
+    if (sprite) sprites.push_back(sprite);
+}
+
+// ---------------------------------------------------------------------------
+// drawSprites — called at end of render(), after PostFX, before frameCounter++
+// ---------------------------------------------------------------------------
+// Blends each registered Sprite2D onto the framebuffer in zOrder sequence.
+// Two paths:
+//   textured  — iterate source rows, colour-key skip, optional alpha blend
+//   solid     — span fill with material->color, optional alpha blend
+//
+// Alpha compositing uses a fast 5-bit RGB565 lerp:
+//   out = src + ((dst - src) * inv_alpha >> 5)
+// which is exact at 0 and 255 and has ≤1 LSB error at mid values.
+// ---------------------------------------------------------------------------
+void Scene::drawSprites() {
+    // On HALF_WIDTH_BUFFERS builds, sprites are composited at full output
+    // resolution during Display::pushFrame() scanout instead — writing them
+    // into the half-width framebuffer here would halve their horizontal
+    // resolution and use the wrong stride.
+#if HALF_WIDTH_BUFFERS
+    return;
+#else
+    if (sprites.empty()) return;
+
+    // Sort by zOrder each frame (list is typically tiny — insertion sort
+    // territory, but std::stable_sort keeps it simple and correct).
+    std::stable_sort(sprites.begin(), sprites.end(),
+        [](const Sprite2D* a, const Sprite2D* b){ return a->zOrder < b->zOrder; });
+
+    for (Sprite2D* sp : sprites) {
+        if (!sp || !sp->enabled || !sp->material) continue;
+        const uint8_t matAlpha = sp->material->alpha;
+        // Combined alpha: 0 = invisible, 255 = opaque.
+        const int combined = ((int)sp->alpha * (int)matAlpha) / 255;
+        if (combined == 0) continue;
+
+        const Texture* tex = sp->material->diffuseMap;
+        const bool opaque  = (combined == 255);
+
+        // Clip dest rect to framebuffer bounds.
+        const int srcW = tex ? tex->width  : sp->width;
+        const int srcH = tex ? tex->height : sp->height;
+        if (srcW <= 0 || srcH <= 0) continue;
+        const int dstW = srcW * sp->scale;
+        const int dstH = srcH * sp->scale;
+
+        const int x0 = sp->x, y0 = sp->y;
+        const int x1 = x0 + dstW, y1 = y0 + dstH;
+        // Clipped dest rect
+        const int dx0 = (x0 < 0) ? 0 : x0;
+        const int dy0 = (y0 < 0) ? 0 : y0;
+        const int dx1 = (x1 > screenWidth)  ? screenWidth  : x1;
+        const int dy1 = (y1 > screenHeight) ? screenHeight : y1;
+        if (dx0 >= dx1 || dy0 >= dy1) continue;
+
+        // Source start offsets for the unscaled (scale==1) path.
+        const int sx0 = dx0 - x0;
+        const int sy0 = dy0 - y0;
+
+        if (tex && sp->scale > 1) {
+            // ---- Nearest-neighbour upscale textured blit (scale > 1) ---------
+            // fp8 step: advances source coord by (1/scale) per output pixel.
+            const int xStep = (srcW << 8) / dstW;
+            const int yStep = (srcH << 8) / dstH;
+            const bool colorKey = tex->hasAlpha;
+            const uint16_t keyColor = tex->alphaColor;
+            const uint16_t* src = tex->data;
+            int sf_y = (dy0 - y0) * yStep;
+            for (int dy = dy0; dy < dy1; ++dy, sf_y += yStep) {
+                const int sy  = sf_y >> 8;   // nearest-neighbour: integer texel
+                uint16_t* dstRow = framebuffer + dy * screenWidth + dx0;
+                int sf_x = (dx0 - x0) * xStep;
+                const int w = dx1 - dx0;
+                for (int i = 0; i < w; ++i, sf_x += xStep) {
+                    const int sx  = sf_x >> 8;
+                    const uint16_t s = src[sy * srcW + sx];
+                    if (colorKey && s == keyColor) continue;
+                    const int sr = (s >> 11) & 0x1F;
+                    const int sg = (s >>  5) & 0x3F;
+                    const int sb =  s        & 0x1F;
+                    if (sp->blendMode == BlendMode::BLEND_ADD) {
+                        const uint16_t d = dstRow[i];
+                        int ar=((d>>11)&0x1F)+sr; if(ar>0x1F)ar=0x1F;
+                        int ag=((d>>5) &0x3F)+sg; if(ag>0x3F)ag=0x3F;
+                        int ab=(d      &0x1F)+sb; if(ab>0x1F)ab=0x1F;
+                        dstRow[i]=(uint16_t)((ar<<11)|(ag<<5)|ab);
+                    } else if (combined == 255) {
+                        dstRow[i]=(uint16_t)((sr<<11)|(sg<<5)|sb);
+                    } else {
+                        const uint16_t d = dstRow[i];
+                        const int inv=255-combined;
+                        const int dr=(d>>11)&0x1F,dg=(d>>5)&0x3F,db=d&0x1F;
+                        dstRow[i]=(uint16_t)(
+                            (((sr*combined+dr*inv)/255)<<11)|
+                            (((sg*combined+dg*inv)/255)<<5)|
+                             ((sb*combined+db*inv)/255));
+                    }
+                }
+            }
+        } else if (tex) {
+            // ---- Textured sprite blit ----------------------------------------
+            const bool colorKey = tex->hasAlpha;
+            const uint16_t keyColor = tex->alphaColor;
+            const uint16_t* src = tex->data;
+
+            if (sp->blendMode == BlendMode::BLEND_ADD) {
+                // Saturating additive: dst = clamp(dst + src). No alpha scaling.
+                for (int dy = dy0; dy < dy1; ++dy) {
+                    const int sy = sy0 + (dy - dy0);
+                    const uint16_t* srcRow = src + sy * tex->width + sx0;
+                    uint16_t*       dstRow = framebuffer + dy * screenWidth + dx0;
+                    const int w = dx1 - dx0;
+                    for (int i = 0; i < w; ++i) {
+                        const uint16_t s = srcRow[i];
+                        if (colorKey && s == keyColor) continue;
+                        const uint16_t d = dstRow[i];
+                        const int sr = (s >> 11) & 0x1F;
+                        const int sg = (s >>  5) & 0x3F;
+                        const int sb =  s        & 0x1F;
+                        int ar = ((d >> 11) & 0x1F) + sr; if (ar > 0x1F) ar = 0x1F;
+                        int ag = ((d >>  5) & 0x3F) + sg; if (ag > 0x3F) ag = 0x3F;
+                        int ab = ( d        & 0x1F) + sb; if (ab > 0x1F) ab = 0x1F;
+                        dstRow[i] = (uint16_t)((ar << 11) | (ag << 5) | ab);
+                    }
+                }
+            } else {
+                for (int dy = dy0; dy < dy1; ++dy) {
+                    const int sy = sy0 + (dy - dy0);
+                    const uint16_t* srcRow = src + sy * tex->width + sx0;
+                    uint16_t*       dstRow = framebuffer + dy * screenWidth + dx0;
+                    const int w = dx1 - dx0;
+
+                    if (opaque) {
+                        if (colorKey) {
+                            for (int i = 0; i < w; ++i) {
+                                if (srcRow[i] != keyColor) dstRow[i] = srcRow[i];
+                            }
+                        } else {
+                            for (int i = 0; i < w; ++i) dstRow[i] = srcRow[i];
+                        }
+                    } else {
+                        // 5-bit lerp: decompose RGB565 into R5/G6/B5 channels,
+                        // lerp each independently, repack.
+                        const int inv = 255 - combined;
+                        for (int i = 0; i < w; ++i) {
+                            const uint16_t s = srcRow[i];
+                            if (colorKey && s == keyColor) continue;
+                            const uint16_t d = dstRow[i];
+                            const int sr = (s >> 11) & 0x1F;
+                            const int sg = (s >>  5) & 0x3F;
+                            const int sb =  s        & 0x1F;
+                            const int dr = (d >> 11) & 0x1F;
+                            const int dg = (d >>  5) & 0x3F;
+                            const int db =  d        & 0x1F;
+                            const int or_ = (sr * combined + dr * inv) / 255;
+                            const int og  = (sg * combined + dg * inv) / 255;
+                            const int ob  = (sb * combined + db * inv) / 255;
+                            dstRow[i] = (uint16_t)((or_ << 11) | (og << 5) | ob);
+                        }
+                    }
+                }
+            }
+        } else {
+            // ---- Solid rectangle fill ----------------------------------------
+            const uint16_t col = sp->material->color;
+
+            if (sp->blendMode == BlendMode::BLEND_ADD) {
+                // Additive: add colour directly, no alpha scaling.
+                const int acr = (col >> 11) & 0x1F;
+                const int acg = (col >>  5) & 0x3F;
+                const int acb =  col        & 0x1F;
+                for (int dy = dy0; dy < dy1; ++dy) {
+                    uint16_t* row = framebuffer + dy * screenWidth + dx0;
+                    const int w = dx1 - dx0;
+                    for (int i = 0; i < w; ++i) {
+                        const uint16_t d = row[i];
+                        int ar = ((d >> 11) & 0x1F) + acr; if (ar > 0x1F) ar = 0x1F;
+                        int ag = ((d >>  5) & 0x3F) + acg; if (ag > 0x3F) ag = 0x3F;
+                        int ab = ( d        & 0x1F) + acb; if (ab > 0x1F) ab = 0x1F;
+                        row[i] = (uint16_t)((ar << 11) | (ag << 5) | ab);
+                    }
+                }
+            } else {
+                if (opaque) {
+                    for (int dy = dy0; dy < dy1; ++dy) {
+                        uint16_t* row = framebuffer + dy * screenWidth + dx0;
+                        const int w = dx1 - dx0;
+                        for (int i = 0; i < w; ++i) row[i] = col;
+                    }
+                } else {
+                    const int inv = 255 - combined;
+                    const int cr = (col >> 11) & 0x1F;
+                    const int cg = (col >>  5) & 0x3F;
+                    const int cb =  col        & 0x1F;
+                    for (int dy = dy0; dy < dy1; ++dy) {
+                        uint16_t* row = framebuffer + dy * screenWidth + dx0;
+                        const int w = dx1 - dx0;
+                        for (int i = 0; i < w; ++i) {
+                            const uint16_t d = row[i];
+                            const int dr = (d >> 11) & 0x1F;
+                            const int dg = (d >>  5) & 0x3F;
+                            const int db =  d        & 0x1F;
+                            const int or_ = (cr * combined + dr * inv) / 255;
+                            const int og  = (cg * combined + dg * inv) / 255;
+                            const int ob  = (cb * combined + db * inv) / 255;
+                            row[i] = (uint16_t)((or_ << 11) | (og << 5) | ob);
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif // !HALF_WIDTH_BUFFERS
 }
 
 void Scene::getStatistics(int& objectCount, int& triangleCount, int& vertexCount) {

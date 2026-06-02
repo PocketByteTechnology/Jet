@@ -3,7 +3,7 @@
 #define FAST_MATH_HPP
 
 #include <cstdint>
-#include "Config.hpp"
+#include "JetConfig.hpp"
 
 #ifdef ESP32
 #include "esp_attr.h"

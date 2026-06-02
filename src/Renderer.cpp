@@ -293,7 +293,7 @@ namespace Renderer
         Texture *diffuseMap = material->diffuseMap;
 #endif
 #if LIGHTING
-        bool emissive = material->emissive;
+        bool emissive = material->emissive || (material->shadingMode == ShadingMode::UNLIT);
 #endif
 
 #if JET_FAST_SIMPLE_SPANS
@@ -638,7 +638,22 @@ namespace Renderer
         int32_t vOverZ2 = (v2.uv.y * oneOverZ2) / FIXED_POINT_SCALE;
         int32_t uOverZ3 = (v3.uv.x * oneOverZ3) / FIXED_POINT_SCALE;
         int32_t vOverZ3 = (v3.uv.y * oneOverZ3) / FIXED_POINT_SCALE;
-#endif
+
+#if LIGHTING
+        // Precompute normal_component / z at each vertex so Phong shading
+        // can use the same perspective-correct reconstruction as UVs.
+        // Same fixed-point scale as uOverZ: n/z * FPS, range ≈ ±FPS.
+        int32_t nxOverZ1 = (v1.normal.x * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t nyOverZ1 = (v1.normal.y * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t nzOverZ1 = (v1.normal.z * oneOverZ1) / FIXED_POINT_SCALE;
+        int32_t nxOverZ2 = (v2.normal.x * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t nyOverZ2 = (v2.normal.y * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t nzOverZ2 = (v2.normal.z * oneOverZ2) / FIXED_POINT_SCALE;
+        int32_t nxOverZ3 = (v3.normal.x * oneOverZ3) / FIXED_POINT_SCALE;
+        int32_t nyOverZ3 = (v3.normal.y * oneOverZ3) / FIXED_POINT_SCALE;
+        int32_t nzOverZ3 = (v3.normal.z * oneOverZ3) / FIXED_POINT_SCALE;
+#endif // LIGHTING
+#endif // PERSPECTIVE_CORRECT_TEXTURES
 
         const int inc = interlacedMode ? 2 : 1;
 
@@ -1296,9 +1311,31 @@ namespace Renderer
                         // the brightness cap; PHONG just pays the per-pixel
                         // normal renormalisation cost on top of GOURAUD.
                         Vector3 pixelNormal;
+#if PERSPECTIVE_CORRECT_TEXTURES
+                        // Perspective-correct normal interpolation: interpolate
+                        // n/z at each vertex then divide by the interpolated
+                        // 1/z — same reconstruction as UV perspective correction.
+                        // Avoids the affine "pinching" visible on oblique faces.
+                        int32_t pctOneOverZ = (oneOverZ1 * w0 + oneOverZ2 * w1 + oneOverZ3 * w2) / denom;
+                        if (pctOneOverZ != 0)
+                        {
+                            int32_t nxOZ = (nxOverZ1 * w0 + nxOverZ2 * w1 + nxOverZ3 * w2) / denom;
+                            int32_t nyOZ = (nyOverZ1 * w0 + nyOverZ2 * w1 + nyOverZ3 * w2) / denom;
+                            int32_t nzOZ = (nzOverZ1 * w0 + nzOverZ2 * w1 + nzOverZ3 * w2) / denom;
+                            pixelNormal.x = (nxOZ * FIXED_POINT_SCALE) / pctOneOverZ;
+                            pixelNormal.y = (nyOZ * FIXED_POINT_SCALE) / pctOneOverZ;
+                            pixelNormal.z = (nzOZ * FIXED_POINT_SCALE) / pctOneOverZ;
+                        }
+                        else
+                        {
+                            pixelNormal = { 0, 0, -(int32_t)FIXED_POINT_SCALE };
+                        }
+#else
+                        // Affine interpolation (no perspective correction).
                         pixelNormal.x = (v1.normal.x * w0 + v2.normal.x * w1 + v3.normal.x * w2) / denom;
                         pixelNormal.y = (v1.normal.y * w0 + v2.normal.y * w1 + v3.normal.y * w2) / denom;
                         pixelNormal.z = (v1.normal.z * w0 + v2.normal.z * w1 + v3.normal.z * w2) / denom;
+#endif
 
                         auto normalLength = pixelNormal.length();
                         if (normalLength > 0)

@@ -13,6 +13,7 @@ enum class ShadingMode {
     GOURAUD,    ///< Per-vertex lit, interpolated across the face.
     PHONG,      ///< Per-pixel lit (more expensive).
     WIREFRAME,  ///< Edges only, no fill.
+    UNLIT,      ///< No lighting at all — raw material colour, fully bright.
 };
 
 /// @brief Surface description: base colour, optional texture/shader and lighting parameters.
@@ -25,7 +26,7 @@ public:
     uint8_t alpha;              ///< Per-material alpha (0=invisible, 255=opaque).
     uint8_t diffuse;            ///< Diffuse reflectance coefficient (0..255).
     uint8_t specular;           ///< Specular reflectance coefficient (0..255).
-    ShadingMode shadingMode = ShadingMode::FLAT; ///< Shading model.
+    ShadingMode shadingMode = ShadingMode::GOURAUD; ///< Shading model.
     char* name;                 ///< Optional name; used for `usemtl` matching in OBJ loading.
 
     /// @brief Construct a material.

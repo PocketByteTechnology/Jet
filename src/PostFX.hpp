@@ -2,7 +2,7 @@
 #define POSTFX_HPP
 
 #include <cstdint>
-#include "Config.hpp"
+#include "JetConfig.hpp"
 
 namespace Renderer {
 

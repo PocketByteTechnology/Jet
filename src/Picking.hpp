@@ -2,7 +2,7 @@
 #define JET_PICKING_HPP
 
 #include <cstdint>
-#include "Config.hpp"
+#include "JetConfig.hpp"
 
 /// @file Picking.hpp
 /// @brief Screen-space cursor picking.

@@ -3,7 +3,7 @@
 
 #include <cstdint>
 #include "FastMath.hpp"
-#include "Config.hpp"
+#include "JetConfig.hpp"
 
 namespace Renderer
 {

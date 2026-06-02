@@ -6,7 +6,7 @@
 #include "Material.hpp"
 #include "Light.hpp"
 #include "Camera.hpp"
-#include "Config.hpp"
+#include "JetConfig.hpp"
 #include "Picking.hpp"
 
 /// @def ZBUFFER_STRIDE(w)

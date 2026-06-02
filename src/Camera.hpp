@@ -5,7 +5,7 @@
 #include "TrigLUT.hpp"
 #include "Shader.hpp"
 #include "Object.hpp"
-#include "Config.hpp"
+#include "JetConfig.hpp"
 
 namespace Renderer {
 

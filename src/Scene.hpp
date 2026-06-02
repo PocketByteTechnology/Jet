@@ -2,12 +2,14 @@
 #define SCENE_HPP
 
 #include <vector>
+#include <algorithm>
 #include "Object.hpp"
 #include "Camera.hpp"
 #include "Light.hpp"
 #include "Renderer.hpp"
-#include "Config.hpp"
+#include "JetConfig.hpp"
 #include "PostFX.hpp"
+#include "Sprite2D.hpp"
 
 namespace Renderer {
 
@@ -47,6 +49,10 @@ public:
     /// @brief Add a point light to the scene.
     /// @param light Light to add. Pointer is borrowed; caller retains ownership.
     void addPointLight(PointLight* light);
+
+    /// @brief Register a 2D screen-space overlay to be drawn after every render().
+    /// @param sprite Sprite to add. Pointer is borrowed; caller retains ownership.
+    void addSprite(Sprite2D* sprite);
 
     /// @brief Set the active camera.
     /// @param cam Camera pointer (borrowed).
@@ -135,6 +141,10 @@ public:
     std::vector<PointLight*>& getPointLights() { return pointLights; }
     /// @brief Get the mutable list of materials owned by the scene.
     std::vector<Material*>& getMaterials() { return materials; }
+    /// @brief Get the list of registered 2D sprites.
+    /// On HALF_WIDTH_BUFFERS builds the display layer composites sprites
+    /// during scanout at full resolution; expose the list so it can do so.
+    std::vector<Sprite2D*>& getSprites() { return sprites; }
 
 #if MAX_PICK_QUERIES > 0
     /// @brief Submit screen-space pick points to be tested during the next render().
@@ -219,6 +229,7 @@ private:
     std::vector<Object*> objects;
     std::vector<PointLight*> pointLights;
     std::vector<Material*> materials;
+    std::vector<Sprite2D*> sprites;
 
     uint16_t backcolor = 0;
     bool clearRenderBuffer = true;
@@ -237,6 +248,14 @@ private:
                       Object* meshSource = nullptr);
     void reconstructCheckerboard();
     void clearBuffers();
+
+public:
+    /// @brief Composite all enabled sprites onto the current framebuffer.
+    ///        Normally called automatically by render(); call explicitly when
+    ///        driving the pipeline via prepareFrame()/rasterizeBand().
+    void drawSprites();
+
+private:
 
 #if MAX_PICK_QUERIES > 0
     PickQuery  pickQueries[MAX_PICK_QUERIES];

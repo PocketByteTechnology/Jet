@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include "Shader.hpp"
-#include "Config.hpp"
+#include "JetConfig.hpp"
 
 namespace Renderer
 {

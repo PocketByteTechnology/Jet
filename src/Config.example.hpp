@@ -2,7 +2,7 @@
 //
 // Each frontend (firmware / desktop / etc.) is expected to keep its OWN copy
 // of this file as `Config.hpp`, sitting somewhere on the include path so the
-// Jet headers resolve `#include "Config.hpp"` to the per-frontend version.
+// Jet headers resolve `#include "JetConfig.hpp"` to the per-frontend version.
 // This way the renderer can be tuned per platform without forking the
 // library or relying on global build flags.
 //
