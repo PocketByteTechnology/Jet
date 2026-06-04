@@ -49,7 +49,7 @@ for exactly that.
 ## Feature highlights
 
 Most of these are individually toggleable via `JetConfig.hpp` (see
-[`src/Config.example.hpp`](src/Config.example.hpp) for the full list and
+[`src/JetConfig.example.hpp`](src/JetConfig.example.hpp) for the full list and
 documentation):
 
 ### Rendering
@@ -74,7 +74,7 @@ documentation):
 
 ### Post-FX
 - "Free" effects (no extra buffer): CRT scanlines, cell-shading.
-- Buffered effects (desktop / large-RAM targets): FXAA, bloom, motion blur,
+- Buffered effects (large-RAM targets): FXAA, bloom, motion blur,
   chromatic aberration, pixelation.
 
 ### Tooling
@@ -88,20 +88,12 @@ documentation):
 
 ## Getting started
 
-A standalone SDL3 desktop frontend lives in the parent repository under
-`desktop/`. Build it from the repo root:
+Jet is a library — it owns no window, display driver, or main loop.
+Add it as a CMake subdirectory or ESP-IDF component, provide a
+`JetConfig.hpp` on your include path (copy and customise
+`src/JetConfig.example.hpp`), then call `scene->render()` once per frame.
 
-```powershell
-cmake -S desktop -B build-desktop -DCMAKE_BUILD_TYPE=Release
-cmake --build build-desktop --config Release --parallel
-.\build-desktop\Release\jet32_desktop.exe
-```
-
-A separate companion repository hosts a growing set of standalone
-example projects (HelloWorld and beyond) built on top of Jet. See the
-project page for the latest link.
-
-For ESP-IDF, depend on the component as you would any other:
+For ESP-IDF, depend on it as you would any other component:
 
 ```yaml
 # main/idf_component.yml

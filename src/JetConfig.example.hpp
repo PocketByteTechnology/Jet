@@ -6,10 +6,6 @@
 // renderer be tuned per platform without forking the library or relying on
 // global build flags.
 //
-// Existing frontend copies in this repo:
-//   * ESP32 firmware : main/firmware/JetConfig.hpp
-//   * SDL3 desktop   : desktop/JetConfig.hpp
-//
 // To start a new frontend, copy this file to <frontend>/JetConfig.hpp and add
 // that directory to the Jet target's include path (see the existing
 // CMakeLists.txt files for the pattern).
@@ -22,9 +18,8 @@
 // coordinates before they enter the renderer's integer transform chain.
 // Increasing this gives the fixed-point rotation math sub-pixel precision,
 // eliminating PS1-style edge wobble at high output resolutions.
-//   * ESP32 firmware  : 4  (low resolution; scaling costs more than it gains)
-//   * SDL3 desktop    : 8  (1080p benefits from sub-pixel precision)
-// Game.hpp exposes this as Game::WORLD_SCALE.
+//   * Low-res targets (e.g. 480×320)  : 4  (scaling costs more than it gains)
+//   * High-res targets (e.g. 1080p)   : 8  (sub-pixel precision is worthwhile)
 #define JET32_WORLD_SCALE 8
 
 // ---------------------------------------------------------------------------
@@ -133,7 +128,7 @@
 // two adjacent output columns. The rasterizer writes at half horizontal
 // resolution; the display driver doubles each pixel on scanout.
 // Halves framebuffer RAM and fill bandwidth — critical on ESP32 SRAM.
-// Set to 0 on platforms with sufficient memory (e.g. desktop, ESP32-P4).
+// Set to 0 on platforms with sufficient memory (e.g. high-res / large-RAM targets).
 #define HALF_WIDTH_BUFFERS 1
 
 // FIELD_BUFFERS: Split the framebuffer into two half-height packed buffers —

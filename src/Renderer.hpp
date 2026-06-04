@@ -84,8 +84,9 @@ class Rasterizer
         uint16_t* reflectBuffer = nullptr;
 
         /// @name Parallel-band water-reflect ordering
-        /// @brief On desktop, WATER_REFLECT reads mirror rows that lie in a
-        /// different y-band being rendered simultaneously by another thread.
+        /// @brief When rasterising in parallel bands across multiple threads,
+        /// WATER_REFLECT reads mirror rows that may lie in a band being rendered
+        /// simultaneously by another thread.
         /// Setting skipWaterReflect on all band copies lets parallel threads
         /// rasterise everything else first; then a single serial pass with
         /// waterReflectOnly=true draws only the water after all bands have joined,
