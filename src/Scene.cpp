@@ -440,8 +440,24 @@ void Scene::prepareFrame() {
     if (directionalLight) directionalLight->updateViewSpaceDirection(camera);
 #endif
 
+    // Thread sky gradient and frame counter into the rasterizer so
+    // WATER_REFLECT shading can sample them. Intentionally outside
+    // #if LIGHTING — works with LIGHTING=0 on firmware.
+    renderer->gradientColors = backgroundGradientColors;
+    renderer->gradientSize   = backgroundGradientColors ? screenHeight : 0;
+    renderer->frameCounter   = frameCounter;
+    renderer->waterTime      = waterTime;
+
     int32_t camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ;
     camera->getRotationMatrix(camCosX, camSinX, camCosY, camSinY, camCosZ, camSinZ);
+
+    // Compute the screen row of the water/sky horizon from the camera's pitch.
+    // Derivation: a world point at the water horizon (infinite Z along forward)
+    // projects to sy = screenH/2 + camSinX * fovFactor / FIXED_POINT_SCALE.
+    // WATER_REFLECT uses mirrorY = 2*waterlineY - y so reflections align
+    // correctly for both near (low on screen) and distant (high on screen) objects.
+    renderer->waterlineY = screenHeight / 2
+                         + (int)(camSinX * camera->fovFactor / 1024.0f);
 
     renderQueue.clear();
     int drawnObjs = 0;

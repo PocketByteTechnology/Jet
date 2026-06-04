@@ -27,7 +27,9 @@ namespace Renderer
         uint16_t alphaColor;                ///< Colour key sampled as fully transparent.
         bool screenSpace;                   ///< When true, the texture is sampled in screen space rather than UV space.
         TextureAddressMode addressMode;     ///< UV addressing mode.
-        uint16_t *palette;                  ///< Optional 256-entry palette; when non-null `data` is treated as indices.
+        uint16_t *palette;                  ///< Optional palette; when non-null `data` is treated as indices.
+        int       paletteSize  = 0;         ///< Number of entries in palette (0 = non-animated / full 256).
+        int       paletteOffset = 0;        ///< Current animation offset; added to every index before lookup.
 
         bool reflectionMap = false;         ///< When true, sampled via reflected view direction instead of UV.
         char* name = nullptr;               ///< Optional name for asset lookup.
@@ -48,6 +50,15 @@ namespace Renderer
         /// @param v Fixed-point V coordinate.
         /// @return Sampled RGB565 colour.
         uint16_t getPixel(int u, int v);
+
+        /// @brief Advance the palette animation by `dt` seconds at `fps` palette-steps per second.
+        ///        No-op if `paletteSize` is 0. Call once per game frame.
+        /// @param dt      Seconds since last call.
+        /// @param fps     How many palette entries to advance per second.
+        inline void advancePalette(float dt, float fps) {
+            if (paletteSize <= 0) return;
+            paletteOffset = (paletteOffset + (int)(dt * fps + 0.5f)) % paletteSize;
+        }
     };
 
 } // namespace Renderer

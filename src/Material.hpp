@@ -9,11 +9,19 @@ namespace Renderer {
 
 /// @brief Per-triangle shading model selection.
 enum class ShadingMode {
-    FLAT,       ///< Single colour per triangle.
-    GOURAUD,    ///< Per-vertex lit, interpolated across the face.
-    PHONG,      ///< Per-pixel lit (more expensive).
-    WIREFRAME,  ///< Edges only, no fill.
-    UNLIT,      ///< No lighting at all — raw material colour, fully bright.
+    FLAT,          ///< Single colour per triangle.
+    GOURAUD,       ///< Per-vertex lit, interpolated across the face.
+    PHONG,         ///< Per-pixel lit (more expensive).
+    WIREFRAME,     ///< Edges only, no fill.
+    UNLIT,         ///< No lighting at all — raw material colour, fully bright.
+    WATER_REFLECT, ///< Screen-space gradient reflection with animated ripple.
+                   ///<   Samples backgroundGradientColors[screenH-1-y + ripple(x,t)]
+                   ///<   then blends toward material->color by material->alpha/255.
+                   ///<   material->specular controls ripple amplitude (0=flat, 32=gentle, 128=stormy).
+    ADDITIVE,      ///< Saturating-add blend: each source channel (scaled by material->alpha/255)
+                   ///<   is added to the destination channel and clamped at the channel maximum.
+                   ///<   Use for neon signs, lamp coronas, explosion halos, and faked dynamic lights.
+                   ///<   Lighting is always bypassed (fully emissive); material->color is the glow tint.
 };
 
 /// @brief Surface description: base colour, optional texture/shader and lighting parameters.
@@ -26,6 +34,10 @@ public:
     uint8_t alpha;              ///< Per-material alpha (0=invisible, 255=opaque).
     uint8_t diffuse;            ///< Diffuse reflectance coefficient (0..255).
     uint8_t specular;           ///< Specular reflectance coefficient (0..255).
+    uint8_t waterYBias = 0;     ///< WATER_REFLECT only: pixels to subtract from the mirror-row index,
+                                ///<   biasing the reflection axis upward to align with the true
+                                ///<   waterline. Stored in device-native pixels (no resolution scaling).
+                                ///<   Set via WaterSurface::setReflectionMode(alpha, rippleAmp, yBias).
     ShadingMode shadingMode = ShadingMode::GOURAUD; ///< Shading model.
     char* name;                 ///< Optional name; used for `usemtl` matching in OBJ loading.
 

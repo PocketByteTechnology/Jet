@@ -101,8 +101,13 @@ uint16_t Texture::getPixel(int u, int v)
     // Retrieve the color from the texture data
     uint16_t color = 0;
     if (palette) {
-        // If a palette is provided, use it to get the color
-        uint8_t colorIndex = data[v * width + u];
+        // If a palette is provided, use it to get the color.
+        // paletteSize>0 means animated: offset the index so the palette
+        // appears to scroll without touching the texture data (Sonic trick).
+        uint8_t colorIndex = ((uint8_t*)data)[v * width + u];
+        if (paletteSize > 0) {
+            colorIndex = (colorIndex + paletteOffset) % paletteSize;
+        }
         color = palette[colorIndex];
     }
     else {

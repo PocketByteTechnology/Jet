@@ -54,6 +54,26 @@ static inline uint16_t blendRGB565(uint16_t dst, uint16_t src, uint8_t alpha)
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
+// Saturating-add blend in RGB565.  Each source channel is scaled by
+// alpha/256 (using a=alpha+1 so a>>8 is exact at alpha=255, giving full
+// source intensity) then added to the corresponding destination channel and
+// clamped at the channel maximum (0x1F for R/B, 0x3F for G).
+// Use for neon glows, lamp coronas, explosion halos, and faked dynamic lights.
+static inline uint16_t addBlendRGB565(uint16_t dst, uint16_t src, uint8_t alpha)
+{
+    const uint32_t a  = (uint32_t)alpha + 1u;
+    const uint32_t sr = (((src >> 11) & 0x1Fu) * a) >> 8;
+    const uint32_t sg = (((src >>  5) & 0x3Fu) * a) >> 8;
+    const uint32_t sb = (( src        & 0x1Fu) * a) >> 8;
+    const uint32_t dr =  (dst >> 11) & 0x1Fu;
+    const uint32_t dg =  (dst >>  5) & 0x3Fu;
+    const uint32_t db =   dst        & 0x1Fu;
+    uint32_t r = dr + sr; if (r > 0x1Fu) r = 0x1Fu;
+    uint32_t g = dg + sg; if (g > 0x3Fu) g = 0x3Fu;
+    uint32_t b = db + sb; if (b > 0x1Fu) b = 0x1Fu;
+    return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
 // -----------------------------------------------------------------------------
 // Directional lighting (lit-only contribution).
 //
@@ -292,8 +312,20 @@ namespace Renderer
 #if TEXTURE_MAPPING
         Texture *diffuseMap = material->diffuseMap;
 #endif
+        const bool isWaterReflect = (material->shadingMode == ShadingMode::WATER_REFLECT);
+        const bool isAdditive     = (material->shadingMode == ShadingMode::ADDITIVE);
+        // Parallel-band ordering guards (see Renderer.hpp skipWaterReflect /
+        // waterReflectOnly).  skipWaterReflect is set on all parallel-band
+        // copies so SSR-reading triangles are deferred; waterReflectOnly is
+        // set on the subsequent serial full-frame pass that draws only water
+        // after all geometry is committed to the framebuffer.
+        if (skipWaterReflect && isWaterReflect)  return false;
+        if (waterReflectOnly && !isWaterReflect) return false;
 #if LIGHTING
-        bool emissive = material->emissive || (material->shadingMode == ShadingMode::UNLIT);
+        bool emissive = material->emissive
+                     || (material->shadingMode == ShadingMode::UNLIT)
+                     || isWaterReflect
+                     || isAdditive;  // additive glows never receive directional light
 #endif
 
 #if JET_FAST_SIMPLE_SPANS
@@ -925,6 +957,50 @@ namespace Renderer
             }
 #endif
 
+            // WATER_REFLECT: precompute the framebuffer row-base for the
+            // mirror scanline (screenH-1-y ± ripple).  clearBuffers() has
+            // already filled every row with the sky gradient, so upper rows
+            // contain sky even before any geometry is drawn.  Anything
+            // rendered before this water object (rocks, hills, etc.) is
+            // also present — giving true screen-space reflections for free.
+            // Colour is set per-pixel in the fast-span and general paths.
+            // Intentionally outside #if LIGHTING — works with LIGHTING=0.
+            int32_t waterMirrorBufBase = 0;
+            if (isWaterReflect)
+            {
+                // `specular` expresses ripple amplitude in pixels at a
+                // canonical 800-pixel reference height.  Scaling by
+                // screenHeight/800 keeps the visual ripple consistent
+                // across resolutions: 28 → 28 px on 800p desktop,
+                // 28 → ~8 px on 240p ESP32.
+                const int amp    = (int)material->specular * screenHeight / 2400; // /3 of original
+                const int angle  = ((y * 5 + (int)(waterTime * 240.0f)) % 360 + 360) % 360;
+                const int ripple = (lookupSinI(angle) * amp) >> 10; // Q10 → pixels
+                // Use the camera-pitch-correct waterline as the mirror axis:
+                // mirrorY = 2*waterlineY - y gives geometrically accurate
+                // reflections for objects at any distance. Falls back to
+                // screen-centre (screenHeight/2) if waterlineY wasn't set.
+                const int wl    = (waterlineY > 0) ? waterlineY : (screenHeight / 2);
+                // waterYBias nudges the sampled row downward (larger mirrorY =
+                // lower on screen) to fine-tune the apparent reflection height.
+                int mirrorY = 2 * wl - y + ripple + (int)material->waterYBias;
+                if (mirrorY < 0)             mirrorY = 0;
+                if (mirrorY >= screenHeight) mirrorY = screenHeight - 1;
+#if HALF_WIDTH_BUFFERS
+  #if FIELD_BUFFERS
+                waterMirrorBufBase = (mirrorY >> 1) * (screenWidth / 2);
+  #else
+                waterMirrorBufBase = mirrorY * (screenWidth / 2);
+  #endif
+#else
+  #if FIELD_BUFFERS
+                waterMirrorBufBase = (mirrorY >> 1) * screenWidth;
+  #else
+                waterMirrorBufBase = mirrorY * screenWidth;
+  #endif
+#endif
+            }
+
 #if JET_FAST_SIMPLE_SPANS
 #if TEXTURE_MAPPING
             // Untextured triangles take the fast simple-span path even in
@@ -1003,7 +1079,38 @@ namespace Renderer
             // still emit the paired 32-bit fast stores; sub-opaque ones
             // fall through to a per-pixel "over" blend against the
             // existing framebuffer contents.
-            if (alpha == 255) {
+            if (isWaterReflect) {
+                // Screen-space reflection: read each pixel from the mirror
+                // row already written in the framebuffer (sky gradient +
+                // any geometry drawn before this water object).
+                // When reflectBuffer is set (SSR_FIELD_REFLECT), read from
+                // the previous field instead — depth-independent, fully
+                // committed prior frame.
+                // mirrorIdx steps in x-lockstep with bufferIndex.
+                const uint16_t* srcBuf = reflectBuffer ? reflectBuffer : framebuffer;
+                int32_t mirrorIdx = waterMirrorBufBase + xStart / 2;
+                for (int x = xStart; x <= xEnd; x += 2, bufferIndex++, mirrorIdx++) {
+                    framebuffer[bufferIndex] = blendRGB565(material->color,
+                                                           srcBuf[mirrorIdx],
+                                                           material->alpha);
+                }
+            } else if (isAdditive) {
+                // Saturating-add: source scaled by alpha then added to destination.
+                // alpha==255 fast path skips the per-channel multiply.
+                if (alpha == 255) {
+                    for (int x = xStart; x <= xEnd; x += 2, bufferIndex++) {
+                        const uint16_t d = framebuffer[bufferIndex];
+                        uint32_t r = ((d >> 11) & 0x1Fu) + ((color >> 11) & 0x1Fu); if (r > 0x1Fu) r = 0x1Fu;
+                        uint32_t g = ((d >>  5) & 0x3Fu) + ((color >>  5) & 0x3Fu); if (g > 0x3Fu) g = 0x3Fu;
+                        uint32_t b = ( d        & 0x1Fu) + ( color        & 0x1Fu); if (b > 0x1Fu) b = 0x1Fu;
+                        framebuffer[bufferIndex] = (uint16_t)((r << 11) | (g << 5) | b);
+                    }
+                } else {
+                    for (int x = xStart; x <= xEnd; x += 2, bufferIndex++) {
+                        framebuffer[bufferIndex] = addBlendRGB565(framebuffer[bufferIndex], color, alpha);
+                    }
+                }
+            } else if (alpha == 255) {
                 const uint32_t color32 = ((uint32_t)color << 16) | color;
                 int idx = bufferIndex;
                 const int idxEnd = bufferIndex + ((xEnd - xStart) >> 1);
@@ -1430,6 +1537,32 @@ namespace Renderer
                 }
 #endif
 #endif
+
+            // WATER_REFLECT on the general (LIGHTING=1) per-pixel path:
+            // sample the mirror row from the framebuffer.  The emissive
+            // flag above already bypassed all lighting modulation.
+            // When reflectBuffer is set, use it instead (prev-field SSR).
+            if (isWaterReflect)
+            {
+                const uint16_t* srcBuf = reflectBuffer ? reflectBuffer : framebuffer;
+#if HALF_WIDTH_BUFFERS
+                const uint16_t reflCol = srcBuf[waterMirrorBufBase + (x >> 1)];
+#else
+                const uint16_t reflCol = srcBuf[waterMirrorBufBase + x];
+#endif
+                color = blendRGB565(material->color, reflCol, material->alpha);
+                // SSR already composited the final pixel; bypass the
+                // standard pixAlpha re-blend below or we get a double-blend
+                // (50% of 50% = 25% reflection strength on desktop).
+                pixAlpha = 255;
+            }
+            else if (isAdditive)
+            {
+                // Pre-compute the saturating add into `color` so the
+                // standard write path below emits it without a second blend.
+                color    = addBlendRGB565(framebuffer[bufferIndex], color, pixAlpha);
+                pixAlpha = 255;
+            }
 
 #if !DEBUG_OVERDRAW
 #if SCREEN_DOOR_ALPHA

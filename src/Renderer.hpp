@@ -63,6 +63,43 @@ class Rasterizer
         int yBandMin = 0;           ///< First row (inclusive) to rasterise. 0 = top of screen.
         int yBandMax = 0x7FFFFFFF;  ///< First row (exclusive) NOT to rasterise. 0x7FFFFFFF = full height.
 
+        /// @name Water reflection support
+        /// @brief Set by Scene before rasterising to enable WATER_REFLECT shading mode.
+        /// @{
+        const uint16_t* gradientColors = nullptr; ///< Per-row sky gradient (screenHeight entries); mirrors backgroundGradientColors.
+        int             gradientSize   = 0;        ///< Number of entries in gradientColors (== screenHeight).
+        int             frameCounter   = 0;        ///< Scene frame counter (dither parity, etc.).
+        float           waterTime      = 0.0f;     ///< Accumulated wall-clock seconds; drives ripple animation.
+        /// @}
+
+        /// @brief Optional alternate colour buffer for SSR mirror reads.
+        ///
+        /// When non-null (and SSR_FIELD_REFLECT is defined), WATER_REFLECT
+        /// triangles sample mirror pixels from this buffer instead of the
+        /// current `framebuffer`. Intended for the previous interlaced field
+        /// buffer so reflections see a fully-rendered prior frame rather than
+        /// the partially-drawn current one.  Set via
+        /// Game::setReflectBuffer() from the render loop each frame.
+        /// nullptr (default) falls back to the current framebuffer.
+        uint16_t* reflectBuffer = nullptr;
+
+        /// @name Parallel-band water-reflect ordering
+        /// @brief On desktop, WATER_REFLECT reads mirror rows that lie in a
+        /// different y-band being rendered simultaneously by another thread.
+        /// Setting skipWaterReflect on all band copies lets parallel threads
+        /// rasterise everything else first; then a single serial pass with
+        /// waterReflectOnly=true draws only the water after all bands have joined,
+        /// guaranteeing that geometry is in the framebuffer before SSR reads it.
+        /// @{
+        bool skipWaterReflect = false;  ///< Skip WATER_REFLECT triangles (parallel-band first pass).
+        bool waterReflectOnly = false;  ///< Draw ONLY WATER_REFLECT triangles (serial second pass).
+        /// @}
+
+        /// @brief Screen row of the water/sky horizon, computed from camera pitch each frame.
+        ///        Used as the reflection axis: mirrorY = 2*waterlineY - y.
+        ///        Defaults to screenHeight/2 (level camera); Scene::prepareFrame() updates it.
+        int waterlineY = 0;
+
         /// @name Distance-based texture LOD
         /// @brief Beyond `textureLodFar`, textured triangles drop their texture
         /// and render as flat `material->color`, taking the fast simple-span

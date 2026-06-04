@@ -28,7 +28,8 @@ public:
     Scene(uint16_t* framebuffer, uint16_t* zBuffer, int screenWidth, int screenHeight);
     ~Scene();
 
-    int frameCounter = 0;       ///< Incremented once per render(); useful for animations and dither parity.
+    int   frameCounter = 0;       ///< Incremented once per render(); useful for animations and dither parity.
+    float waterTime    = 0.0f;    ///< Accumulated wall-clock seconds; set each frame by the caller before render/prepareFrame.
 
     /// @name Per-frame counters populated by render()
     /// @{
