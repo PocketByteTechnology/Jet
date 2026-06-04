@@ -30,7 +30,7 @@ Jet is opinionated. Its sweet spot is:
 - **Stylised / retro 3D** - flat-shaded, gouraud-shaded or affine-textured
   geometry, RGB565 framebuffers, the look of late-90s console / arcade 3D.
 - **Hard real-time, fixed budget** - every feature is a compile-time switch in
-  `Config.hpp`, so you only pay (in flash, RAM and CPU) for what you actually
+  `JetConfig.hpp`, so you only pay (in flash, RAM and CPU) for what you actually
   use. Disable Z-buffering, perspective-correct texturing or per-pixel
   lighting and the code for them simply isn't compiled in.
 - **Tiny memory footprints** - fixed-point math throughout the hot path, an
@@ -48,7 +48,7 @@ for exactly that.
 
 ## Feature highlights
 
-Most of these are individually toggleable via `Config.hpp` (see
+Most of these are individually toggleable via `JetConfig.hpp` (see
 [`src/Config.example.hpp`](src/Config.example.hpp) for the full list and
 documentation):
 
@@ -109,7 +109,7 @@ dependencies:
   jet: "*"
 ```
 
-…and provide a `Config.hpp` next to your application.
+…and provide a `JetConfig.hpp` next to your application.
 
 ### Minimal example
 
