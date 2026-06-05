@@ -66,6 +66,19 @@ documentation):
 - Per-object distance-based fade in / fade out (LOD pop reduction) and
   scene-wide depth fog.
 - Interlaced or Checkerboard rendering (with optional reconstruction)
+- **`WATER_REFLECT` shading mode** — animated screen-space water surface.
+  Reflects the background sky gradient about a camera-pitch-correct waterline,
+  with per-material ripple amplitude (`specular`) and vertical bias
+  (`waterYBias`). Blended toward a flat tint by `material->alpha`.
+- **`ADDITIVE` shading mode** — saturating-add blend (src × alpha + dst).
+  Fully emissive; intended for neon signs, lamp coronas, explosion halos,
+  and faked dynamic lights.
+- **`SSR_FIELD_REFLECT`** — when `FIELD_BUFFERS` is active, `WATER_REFLECT`
+  samples mirror pixels from the *previous* committed field buffer so
+  reflections are never depth-order dependent and never show render-order
+  artefacts across parallel rendering bands.
+- Perspective-correct Phong normal interpolation (complements the existing
+  perspective-correct UV path).
 
 ### Lighting
 - Ambient + directional lights with FLAT / GOURAUD / PHONG shading.
@@ -82,9 +95,34 @@ documentation):
   pyramid / grid / plane / quad / billboard.
 - Minimal Wavefront `.obj` loader.
 - Optional screen-space picking (compile-time bounded; zero cost when set to
-  0).
+  0). Returns the closest hit object, triangle index, depth and snapped pixel
+  coordinate.
+- Animated palette textures — `Texture::advancePalette(dt, fps)` cycles the
+  palette offset by `dt × fps` entries per call; no-op when `paletteSize` is 0.
 - A small custom shader entry point if you need to step outside the
   fixed-function path.
+
+### 2D Sprites
+- `Sprite2D` — a lightweight composited 2D sprite drawn over the scene after
+  `render()`. Supports textured or solid-colour fills, colour-key transparency,
+  optional alpha blend, additive blend, integer upscaling, and `zOrder`-based
+  draw order. On `HALF_WIDTH_BUFFERS` builds sprites are composited at full
+  output resolution during display scanout.
+
+### Particles
+- `ParticleSystem` — a fixed-pool (no-heap) particle system rendered directly
+  through the rasteriser after `scene->render()`. Ships with a spark emitter
+  (impact sparks with white → blue lifecycle) and a water-splash emitter
+  (short-lived foam-to-blue spray). Distance LOD culls particles that are too
+  far from the camera; emitter count and lifetime are tunable.
+
+### Lens flare
+- `LensFlare` — an n-element sprite chain that projects a directional light
+  source to screen space, optionally queries a pick slot for sun occlusion
+  testing, and repositions flare elements along the sun → screen-centre axis
+  each frame. Fade speed, per-element axis offset (`axisT`), base alpha, blend
+  mode and integer scale are all configurable. Works without picking
+  (`MAX_PICK_QUERIES = 0`), in which case the sun is treated as unobstructed.
 
 ## Getting started
 
