@@ -74,6 +74,57 @@ static inline uint16_t addBlendRGB565(uint16_t dst, uint16_t src, uint8_t alpha)
     return (uint16_t)((r << 11) | (g << 5) | b);
 }
 
+static inline void fillRGB565Span(uint16_t* framebuffer, int32_t bufferIndex, int32_t count, uint16_t color)
+{
+    if (count <= 0) return;
+
+    int32_t idx = bufferIndex;
+    int32_t remaining = count;
+    if (idx & 1) {
+        framebuffer[idx++] = color;
+        --remaining;
+    }
+
+    const uint32_t color32 = ((uint32_t)color << 16) | color;
+    int32_t pairs = remaining >> 1;
+    uint32_t* out = reinterpret_cast<uint32_t*>(&framebuffer[idx]);
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+    if (pairs >= 8) {
+        while (pairs > 0 && (((uintptr_t)out & 0x0F) != 0)) {
+            *out++ = color32;
+            --pairs;
+        }
+
+        const int32_t quads = pairs >> 2;
+        if (quads > 0) {
+            __asm__ volatile (
+                "ee.movi.32.q q0, %[v], 0\n\t"
+                "ee.movi.32.q q0, %[v], 1\n\t"
+                "ee.movi.32.q q0, %[v], 2\n\t"
+                "ee.movi.32.q q0, %[v], 3\n\t"
+                : : [v] "r"(color32)
+            );
+            const int stride = 16;
+            for (int32_t i = 0; i < quads; ++i) {
+                __asm__ volatile (
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    : [p] "+r"(out) : [s] "r"(stride) : "memory"
+                );
+            }
+            pairs -= quads << 2;
+        }
+    }
+#endif
+
+    for (int32_t i = 0; i < pairs; ++i) {
+        *out++ = color32;
+    }
+    if (remaining & 1) {
+        *reinterpret_cast<uint16_t*>(out) = color;
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Directional lighting (lit-only contribution).
 //
@@ -458,7 +509,11 @@ namespace Renderer
         }
 #endif
 
+    #if TEXTURE_MAPPING
         uint16_t color = material->getColor({0, 0});
+    #else
+        uint16_t color = material->color;
+    #endif
         // Untextured triangles use this single material colour as the
         // per-pixel modulation input. Keeping the unmodulated base in a
         // separate variable is critical: previously the per-pixel
@@ -657,6 +712,8 @@ namespace Renderer
             if (alpha == 0) return false; // Fully-transparent triangle: nothing to draw.
         }
 #endif
+
+        const bool plainOpaqueReplace = (alpha == 255 && !isWaterReflect && !isAdditive);
 
 #if PERSPECTIVE_CORRECT_TEXTURES
         int32_t oneOverZ1 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v1.position.z;
@@ -966,6 +1023,8 @@ namespace Renderer
             // Colour is set per-pixel in the fast-span and general paths.
             // Intentionally outside #if LIGHTING — works with LIGHTING=0.
             int32_t waterMirrorBufBase = 0;
+            uint8_t waterReflectAlpha = material->alpha;
+            bool waterSkyFallback = false;
             if (isWaterReflect)
             {
                 // `specular` expresses ripple amplitude in pixels at a
@@ -984,8 +1043,19 @@ namespace Renderer
                 // waterYBias nudges the sampled row downward (larger mirrorY =
                 // lower on screen) to fine-tune the apparent reflection height.
                 int mirrorY = 2 * wl - y + ripple + (int)material->waterYBias;
+                // Sky fallback: when the reflection would sample off the top of
+                // the screen, use gradientColors[0] (the topmost sky colour)
+                // as the reflected pixel so the blend picks up the right sky hue
+                // instead of repeating framebuffer row 0.
+                waterSkyFallback = mirrorY < 0 &&
+                                   gradientColors != nullptr &&
+                                   gradientSize > 0;
                 if (mirrorY < 0)             mirrorY = 0;
                 if (mirrorY >= screenHeight) mirrorY = screenHeight - 1;
+                constexpr int kSsrTopFadePx = 32;
+                if (mirrorY < kSsrTopFadePx) {
+                    waterReflectAlpha = (uint8_t)(((uint16_t)material->alpha * mirrorY) / kSsrTopFadePx);
+                }
 #if HALF_WIDTH_BUFFERS
   #if FIELD_BUFFERS
                 waterMirrorBufBase = (mirrorY >> 1) * (screenWidth / 2);
@@ -1044,25 +1114,7 @@ namespace Renderer
                 // writes when alignment permits. Halves the store count on
                 // the hot path - this is where most of the per-frame time
                 // goes for near-opaque geometry.
-                const uint32_t color32 = ((uint32_t)color << 16) | color;
-                int idx = bufferIndex;
-                const int idxEnd = bufferIndex + ((xEnd - xStart) >> 1); // inclusive
-                // Leading single store if the start is misaligned.
-                if (idx & 1) {
-                    framebuffer[idx++] = color;
-                }
-                // Middle: paired 32-bit stores.
-                const int pairs = (idxEnd - idx + 1) >> 1;
-                uint32_t* fb32 = reinterpret_cast<uint32_t*>(&framebuffer[idx]);
-                for (int i = 0; i < pairs; ++i) {
-                    fb32[i] = color32;
-                }
-                idx += pairs * 2;
-                // Trailing single store if the run length is odd.
-                if (idx <= idxEnd) {
-                    framebuffer[idx] = color;
-                }
-                bufferIndex = idxEnd + 1;
+                fillRGB565Span(framebuffer, bufferIndex, ((xEnd - xStart) >> 1) + 1, color);
             } else {
                 // Alternating fill: only one of the two phases draws. Pick
                 // the matching phase bool and stride by 4 pixels (2 slots).
@@ -1079,7 +1131,9 @@ namespace Renderer
             // still emit the paired 32-bit fast stores; sub-opaque ones
             // fall through to a per-pixel "over" blend against the
             // existing framebuffer contents.
-            if (isWaterReflect) {
+            if (plainOpaqueReplace) {
+                fillRGB565Span(framebuffer, bufferIndex, ((xEnd - xStart) >> 1) + 1, color);
+            } else if (isWaterReflect) {
                 // Screen-space reflection: read each pixel from the mirror
                 // row already written in the framebuffer (sky gradient +
                 // any geometry drawn before this water object).
@@ -1089,10 +1143,12 @@ namespace Renderer
                 // mirrorIdx steps in x-lockstep with bufferIndex.
                 const uint16_t* srcBuf = reflectBuffer ? reflectBuffer : framebuffer;
                 int32_t mirrorIdx = waterMirrorBufBase + xStart / 2;
+                const uint16_t skyCol = waterSkyFallback ? gradientColors[0] : 0;
                 for (int x = xStart; x <= xEnd; x += 2, bufferIndex++, mirrorIdx++) {
+                    const uint16_t reflPx = waterSkyFallback ? skyCol : srcBuf[mirrorIdx];
                     framebuffer[bufferIndex] = blendRGB565(material->color,
-                                                           srcBuf[mirrorIdx],
-                                                           material->alpha);
+                                                           reflPx,
+                                                           waterReflectAlpha);
                 }
             } else if (isAdditive) {
                 // Saturating-add: source scaled by alpha then added to destination.
@@ -1110,23 +1166,6 @@ namespace Renderer
                         framebuffer[bufferIndex] = addBlendRGB565(framebuffer[bufferIndex], color, alpha);
                     }
                 }
-            } else if (alpha == 255) {
-                const uint32_t color32 = ((uint32_t)color << 16) | color;
-                int idx = bufferIndex;
-                const int idxEnd = bufferIndex + ((xEnd - xStart) >> 1);
-                if (idx & 1) {
-                    framebuffer[idx++] = color;
-                }
-                const int pairs = (idxEnd - idx + 1) >> 1;
-                uint32_t* fb32 = reinterpret_cast<uint32_t*>(&framebuffer[idx]);
-                for (int i = 0; i < pairs; ++i) {
-                    fb32[i] = color32;
-                }
-                idx += pairs * 2;
-                if (idx <= idxEnd) {
-                    framebuffer[idx] = color;
-                }
-                bufferIndex = idxEnd + 1;
             } else {
                 for (int x = xStart; x <= xEnd; x += 2, bufferIndex++) {
                     framebuffer[bufferIndex] = blendRGB565(framebuffer[bufferIndex], color, alpha);
@@ -1545,12 +1584,17 @@ namespace Renderer
             if (isWaterReflect)
             {
                 const uint16_t* srcBuf = reflectBuffer ? reflectBuffer : framebuffer;
+                uint16_t reflCol;
+                if (waterSkyFallback && gradientColors != nullptr && gradientSize > 0) {
+                    reflCol = gradientColors[0];
+                } else {
 #if HALF_WIDTH_BUFFERS
-                const uint16_t reflCol = srcBuf[waterMirrorBufBase + (x >> 1)];
+                    reflCol = srcBuf[waterMirrorBufBase + (x >> 1)];
 #else
-                const uint16_t reflCol = srcBuf[waterMirrorBufBase + x];
+                    reflCol = srcBuf[waterMirrorBufBase + x];
 #endif
-                color = blendRGB565(material->color, reflCol, material->alpha);
+                }
+                color = blendRGB565(material->color, reflCol, waterReflectAlpha);
                 // SSR already composited the final pixel; bypass the
                 // standard pixAlpha re-blend below or we get a double-blend
                 // (50% of 50% = 25% reflection strength on desktop).

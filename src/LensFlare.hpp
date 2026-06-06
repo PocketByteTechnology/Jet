@@ -16,8 +16,9 @@ namespace Renderer {
 ///
 /// Each frame, the helper:
 ///   1. Projects the light direction to a screen-space point.
-///   2. Uses a single PickQuery (slot `pickSlot`) on that pixel to test
+///   2. When MAX_PICK_QUERIES > 0, uses a PickQuery on that pixel to test
 ///      whether any geometry occludes the "sun". No hit => sun visible.
+///      When picking is compiled out, the sun is treated as unobstructed.
 ///   3. Repositions a fixed set of Sprite2D elements along the line that
 ///      passes through both the sun's screen position and the screen centre,
 ///      and sets their alpha to reflect the current visibility (with optional
@@ -40,11 +41,10 @@ namespace Renderer {
 ///     flare.update(dt);
 /// @endcode
 ///
-/// @note Requires MAX_PICK_QUERIES > 0 in JetConfig.hpp.
+/// @note MAX_PICK_QUERIES > 0 enables occlusion testing; the flare still
+///       renders without occlusion when picking is compiled out.
 /// @note The LensFlare registers all sprites with the scene on construction;
 ///       do not call scene->addSprite() for the same sprites separately.
-
-#if MAX_PICK_QUERIES > 0
 
 class LensFlare {
 public:
@@ -106,7 +106,7 @@ public:
     }
 
     /// @brief Call once per frame BEFORE scene->render() to submit the pick
-    ///        query and compute sun screen position.
+    ///        query, when enabled, and compute sun screen position.
     ///
     /// @param camera     Active camera. Must match what scene will render with.
     /// @param screenW    Render width in pixels  (framebuffer coords).
@@ -125,9 +125,13 @@ public:
         if (!sunInFrustum) {
             // Disable all sprites immediately.
             for (int i = 0; i < elementCount; ++i) sprites[i].enabled = false;
+#if MAX_PICK_QUERIES > 0
             // Still need to clear the pick slot so it doesn't report stale results.
-            PickQuery q;  q.x = -1;  q.y = -1;
-            scene->setPickQueries(&q, 1);   // slot 0 only; see note below
+            PickQuery queries[MAX_PICK_QUERIES] = {};
+            const int slot = pickSlot < 0 ? 0 : (pickSlot >= MAX_PICK_QUERIES ? MAX_PICK_QUERIES - 1 : pickSlot);
+            for (int i = 0; i <= slot; ++i) { queries[i].x = -1; queries[i].y = -1; }
+            scene->setPickQueries(queries, slot + 1);
+#endif
             return;
         }
 
@@ -146,16 +150,19 @@ public:
         const int pqx = sunScreenX < 0 ? 0 : (sunScreenX >= screenW  ? screenW  - 1 : sunScreenX);
         const int pqy = sunScreenY < 0 ? 0 : (sunScreenY >= screenH ? screenH - 1 : sunScreenY);
 
-        // Submit pick query for the sun pixel.
-        PickQuery q;
-        q.x = (int16_t)pqx;
-        q.y = (int16_t)pqy;
-        // We only manage one slot; the caller specified which index to use.
-        // Scene::setPickQueries replaces all queries so we must submit all
-        // slots the caller wants active. For simplicity we take exclusive
-        // ownership of the whole query array here — if the caller also needs
-        // other pick queries they should subclass / extend this helper.
-        scene->setPickQueries(&q, 1);
+    #if MAX_PICK_QUERIES > 0
+        // Submit pick query for the sun pixel. Scene::setPickQueries replaces
+        // all queries, so fill disabled slots up through our selected slot.
+        PickQuery queries[MAX_PICK_QUERIES] = {};
+        const int slot = pickSlot < 0 ? 0 : (pickSlot >= MAX_PICK_QUERIES ? MAX_PICK_QUERIES - 1 : pickSlot);
+        for (int i = 0; i <= slot; ++i) { queries[i].x = -1; queries[i].y = -1; }
+        queries[slot].x = (int16_t)pqx;
+        queries[slot].y = (int16_t)pqy;
+        scene->setPickQueries(queries, slot + 1);
+    #else
+        (void)pqx;
+        (void)pqy;
+    #endif
     }
 
     /// @brief Call once per frame AFTER scene->render() to read pick results,
@@ -199,10 +206,12 @@ public:
         // Clamp to [0,1]: negative when sun is off-screen; sprites get alpha=0.
         if (edgeFade < 0.0f) edgeFade = 0.0f;
 
-        // Read pick result for our slot.
-        // const PickResult* results = scene->getPickResults();
-        // const bool occluded = results && results[0].hit;
-        const bool occluded = false;  // TEST: always visible — re-enable pick check when confirmed working
+        bool occluded = false;
+    #if MAX_PICK_QUERIES > 0
+        const PickResult* results = scene->getPickResults();
+        const int slot = pickSlot < 0 ? 0 : (pickSlot >= MAX_PICK_QUERIES ? MAX_PICK_QUERIES - 1 : pickSlot);
+        occluded = results && scene->getPickQueryCount() > slot && results[slot].hit;
+    #endif
 
         // Fade visibility toward target.
         const float target = occluded ? 0.0f : 1.0f;
@@ -302,7 +311,5 @@ private:
     Element  elems[MAX_FLARE_ELEMENTS];
     Sprite2D sprites[MAX_FLARE_ELEMENTS];
 };
-
-#endif // MAX_PICK_QUERIES > 0
 
 } // namespace Renderer

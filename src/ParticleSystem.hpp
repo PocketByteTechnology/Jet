@@ -40,6 +40,13 @@ static constexpr int PARTICLE_POOL_SIZE = 200;
 // RGB565 colour keyframes
 static constexpr uint16_t SPARK_COL_WHITE = 0xFFFF;
 static constexpr uint16_t SPARK_COL_BLUE  = 0x055F;  // electric blue #00A8F8
+static constexpr uint16_t SPLASH_COL_FOAM = 0xEFFF;
+static constexpr uint16_t SPLASH_COL_BLUE = 0x5DDF;
+
+enum class ParticleKind : uint8_t {
+    Spark,
+    Splash,
+};
 
 // ---- Single particle -------------------------------------------------------
 struct Particle {
@@ -47,6 +54,7 @@ struct Particle {
     Vec3f vel;
     float life;     ///< Seconds remaining.
     float maxLife;  ///< Total lifespan in seconds.
+    ParticleKind kind = ParticleKind::Spark;
     bool  active;
 };
 
@@ -100,6 +108,45 @@ public:
             const float lifeVar  = 0.10f + 0.25f * lifeFrac;
             p->maxLife = lifeMin + randF() * lifeVar;
             p->life    = p->maxLife;
+            p->kind    = ParticleKind::Spark;
+            p->active  = true;
+        }
+    }
+
+    /// @brief Emit a short water spray from a ship fin skimming the surface.
+    /// @param origin World-space fin contact point.
+    /// @param travelDir Unit-ish direction of ship travel; splash streaks align to this.
+    /// @param sideDir Unit-ish vector pointing out from the ship side.
+    /// @param upDir Track/local up vector for upward spray bias.
+    /// @param speed Characteristic ship speed.
+    /// @param count Number of particles to spawn.
+    /// @param baseVel Inherited ship velocity.
+    void emitWaterSplash(const Vec3f& origin, const Vec3f& travelDir,
+                         const Vec3f& sideDir, const Vec3f& upDir,
+                         float speed, int count,
+                         const Vec3f& baseVel = Vec3f{0.0f, 0.0f, 0.0f}) {
+        const float baseSpeed = 70.0f * worldScale + speed * 0.10f;
+        for (int n = 0; n < count; ++n) {
+            Particle* p = allocate();
+            if (!p) break;
+
+            float rx = randF() - 0.5f;
+            float rz = randF() - 0.5f;
+            Vec3f dir {
+                travelDir.x * 1.15f + sideDir.x * 0.28f + upDir.x * 0.35f + rx * 0.20f,
+                travelDir.y * 1.15f + sideDir.y * 0.28f + upDir.y * 0.35f + fabsf(randF()) * 0.25f,
+                travelDir.z * 1.15f + sideDir.z * 0.28f + upDir.z * 0.35f + rz * 0.20f
+            };
+            float dlen = dir.length();
+            if (dlen < 1e-4f) dlen = 1.0f;
+            dir = dir * (1.0f / dlen);
+
+            float spd = baseSpeed * (0.55f + randF() * 0.75f);
+            p->vel    = dir * spd + baseVel * 0.25f;
+            p->pos    = origin;
+            p->maxLife = 0.12f + randF() * 0.3f;
+            p->life    = p->maxLife;
+            p->kind    = ParticleKind::Splash;
             p->active  = true;
         }
     }
@@ -215,18 +262,27 @@ public:
 
             // Smooth white → blue crossfade over age 0.25–0.45.
             // White: R=31 G=63 B=31 (0xFFFF); Blue: R=0 G=42 B=31 (0x055F).
-            uint16_t sparkCol;
-            if (age < 0.25f) {
-                sparkCol = SPARK_COL_WHITE;
+            uint16_t particleCol;
+            if (p.kind == ParticleKind::Splash) {
+                if (age < 0.35f) {
+                    particleCol = SPLASH_COL_FOAM;
+                } else {
+                    const float t = std::min(1.0f, (age - 0.35f) / 0.65f);
+                    const uint8_t rC = (uint8_t)(29.0f * (1.0f - t) + 11.0f * t + 0.5f);
+                    const uint8_t gC = (uint8_t)(63.0f * (1.0f - t) + 46.0f * t + 0.5f);
+                    particleCol = ((uint16_t)rC << 11) | ((uint16_t)gC << 5) | 31u;
+                }
+            } else if (age < 0.25f) {
+                particleCol = SPARK_COL_WHITE;
             } else if (age < 0.45f) {
                 const float t  = (age - 0.25f) * 5.0f;
                 const uint8_t rC = (uint8_t)(31.0f * (1.0f - t) + 0.5f);
                 const uint8_t gC = (uint8_t)(63.0f * (1.0f - t) + 42.0f * t + 0.5f);
-                sparkCol = ((uint16_t)rC << 11) | ((uint16_t)gC << 5) | 31u;
+                particleCol = ((uint16_t)rC << 11) | ((uint16_t)gC << 5) | 31u;
             } else {
-                sparkCol = SPARK_COL_BLUE;
+                particleCol = SPARK_COL_BLUE;
             }
-            mat.color = sparkCol;
+            mat.color = particleCol;
 
             // Transform world pos to camera space
             const int32_t wx = (int32_t)p.pos.x - cam->position.x;
