@@ -15,6 +15,11 @@ void DirectionalLight::updateDirection(Vector3 newDirection) {
 }
 
 void DirectionalLight::calculateLightDirection() {
+    // The trig tables are normally initialised by Scene::Scene(), but
+    // a DirectionalLight can be constructed before any Scene exists (e.g.
+    // as a struct member alongside a Scene*).  Guard against that here so
+    // worldLightDir is always valid regardless of construction order.
+    if (sin_table[90] == 0) initializeTrigTables();
     int32_t azimuthDeg = (direction.x + ANGLE_MAX) % ANGLE_MAX; // Keep within 0-359 range
     int32_t elevationDeg = (direction.y + ANGLE_MAX) % ANGLE_MAX; // Ignore direction.z
 
