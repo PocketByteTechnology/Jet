@@ -337,9 +337,17 @@ void PERF_CRITICAL Scene::clearBuffers() {
             // we'd get backcolor's low byte duplicated. Pack two pixels per
             // 32-bit store and walk rows so the gradient (if any) actually
             // shows up.
+            // HALF_WIDTH_BUFFERS makes the buffer half-width. FIELD_BUFFERS
+            // additionally halves the height (each field buffer covers every other
+            // row). When only HALF_WIDTH_BUFFERS is set the buffer is half-width
+            // but FULL-height, so rowCount must be screenHeight in that case.
             #if HALF_WIDTH_BUFFERS
             const int rowPixels = screenWidth / 2;
+            #if FIELD_BUFFERS
             const int rowCount  = screenHeight / 2;
+            #else
+            const int rowCount  = screenHeight;
+            #endif
             #else
             const int rowPixels = screenWidth;
             const int rowCount  = screenHeight;
