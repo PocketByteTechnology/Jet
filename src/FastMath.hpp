@@ -3,6 +3,7 @@
 #define FAST_MATH_HPP
 
 #include <cstdint>
+#include <cmath>
 #include "JetConfig.hpp"
 
 #ifdef ESP32
@@ -33,12 +34,11 @@ namespace FastMath
 
     inline int64_t PERF_CRITICAL approximateSqrt(int64_t value)
     {
-        // Use a simplified method to find the approximate square root
-        // Example: Using a lookup or bit-shifting method for efficiency
-        int64_t approx = initialEstimate(value); // Initial estimate from a LUT or bit-shifting trick
-        // Optional refinement to improve precision
-        approx = (approx + value / approx) >> 1;
-        return approx;
+        // Delegated to std::sqrt; the FPU on every target Jet runs on (Xtensa LX7,
+        // ARM Cortex-M/A, x86) makes this a single instruction — no slower than the
+        // previous single-Newton-step approximation, and actually correct.
+        if (value <= 0) return 0;
+        return static_cast<int64_t>(std::sqrt(static_cast<double>(value)));
     }
 
     inline int64_t initialEstimateFixedPoint(int64_t value, int32_t fixedPointShift)
@@ -49,12 +49,11 @@ namespace FastMath
 
     inline int64_t approximateInverseSqrt(int64_t value)
     {
-        // Use a simplified method to find the approximate inverse square root
-        // Example: Using Newton's method to refine approximation (optional)
-        int64_t approx = FastMath::initialEstimate(value); // Initial estimate from a LUT or bit-shifting trick
-        // Optional refinement to improve precision
-        approx = ((3 * approx - (approx * approx * value)) >> 1) >> 1;
-        return approx;
+        // 1/sqrt via std::sqrt; avoids the broken Newton step from the placeholder
+        // initial estimate that produced near-constant output.
+        if (value <= 0) return 0;
+        const double s = std::sqrt(static_cast<double>(value));
+        return s > 0.0 ? static_cast<int64_t>(1.0 / s) : 0;
     }
 
     inline int64_t approximateSqrtFixedPoint(int64_t value, int32_t fixedPointShift)
