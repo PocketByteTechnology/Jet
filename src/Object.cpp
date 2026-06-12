@@ -1,4 +1,5 @@
 #include "Object.hpp"
+#include "Light.hpp"
 #include "TrigLUT.hpp"
 #include <cmath>
 
@@ -212,4 +213,68 @@ namespace Renderer
     {
         lookAt(targetObject->position);
     }
+    void Object::bakeFlatLighting(const DirectionalLight* directionalLight,
+                                   const AmbientLight*     ambientLight)
+    {
+        // Ambient components (0 if no ambient light).
+        const uint32_t ambR = ambientLight ? ambientLight->color.r : 0;
+        const uint32_t ambG = ambientLight ? ambientLight->color.g : 0;
+        const uint32_t ambB = ambientLight ? ambientLight->color.b : 0;
+
+        for (auto& tri : triangles) {
+            tri.colorBaked = false;
+            if (!tri.material) continue;
+            if (tri.material->diffuseMap) continue; // textured — skip
+            const ShadingMode mode = tri.material->shadingMode;
+            if (mode != ShadingMode::FLAT &&
+                mode != ShadingMode::GOURAUD &&
+                mode != ShadingMode::UNLIT) continue;
+            if (mode == ShadingMode::UNLIT ||
+                (!directionalLight && !ambientLight)) {
+                // Already emissive / no lights — just stamp the raw colour.
+                tri.bakedColor = tri.material->color;
+                tri.colorBaked = true;
+                continue;
+            }
+
+            // Compute brightness from the face normal (v1 for FLAT/GOURAUD).
+            // Use the same squared-falloff Lambert as jetShadeBrightness.
+            uint32_t brightness = 0;
+            if (directionalLight) {
+                const Vector3& N = vertices[tri.v1].normal;
+                const Vector3& L = directionalLight->worldLightDir;
+                int64_t dot = (int64_t)N.x * L.x + (int64_t)N.y * L.y + (int64_t)N.z * L.z;
+                if (dot > 0) {
+                    uint32_t lambert = (uint32_t)(dot >> 12);
+                    if (lambert > 255) lambert = 255;
+                    lambert = (lambert * lambert + 128) >> 8;  // squared falloff
+                    lambert = (lambert * (uint32_t)directionalLight->intensity) >> 8;
+                    brightness = (lambert * (uint32_t)tri.material->diffuse) >> 8;
+                    const uint32_t maxBrightness = 255u + tri.material->specular;
+                    if (brightness > maxBrightness) brightness = maxBrightness;
+                }
+            }
+
+            // Per-channel modulation (mirrors jetModulateRGB565 in Renderer.cpp).
+            const uint16_t base = tri.material->color;
+            const uint32_t maxBrightness = 255u + tri.material->specular;
+            const uint32_t tR = std::min(brightness + ambR, maxBrightness);
+            const uint32_t tG = std::min(brightness + ambG, maxBrightness);
+            const uint32_t tB = std::min(brightness + ambB, maxBrightness);
+            auto ch5 = [](uint32_t base5, uint32_t t) -> uint32_t {
+                if (t > 255) { const uint32_t blow = t-255; return base5 + ((31u-base5)*blow)/256u; }
+                const uint32_t v = base5 * t; return (v + 128u + (v>>8)) >> 8;
+            };
+            auto ch6 = [](uint32_t base6, uint32_t t) -> uint32_t {
+                if (t > 255) { const uint32_t blow = t-255; return base6 + ((63u-base6)*blow)/256u; }
+                const uint32_t v = base6 * t; return (v + 128u + (v>>8)) >> 8;
+            };
+            const uint32_t r = ch5((base >> 11) & 0x1Fu, tR);
+            const uint32_t g = ch6((base >>  5) & 0x3Fu, tG);
+            const uint32_t b = ch5( base        & 0x1Fu, tB);
+            tri.bakedColor = (uint16_t)((r << 11) | (g << 5) | b);
+            tri.colorBaked = true;
+        }
+    }
+
 } // namespace Renderer

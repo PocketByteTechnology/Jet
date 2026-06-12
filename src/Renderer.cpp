@@ -106,7 +106,19 @@ static inline void fillRGB565Span(uint16_t* framebuffer, int32_t bufferIndex, in
                 : : [v] "r"(color32)
             );
             const int stride = 16;
-            for (int32_t i = 0; i < quads; ++i) {
+            // 4x-unrolled: one loop iteration retires 64 bytes. The asm
+            // blocks are volatile with a memory clobber, so GCC can't
+            // unroll them itself — do it by hand to amortise the branch.
+            for (int32_t i = quads >> 2; i > 0; --i) {
+                __asm__ volatile (
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    "ee.vst.128.xp q0, %[p], %[s]\n\t"
+                    : [p] "+r"(out) : [s] "r"(stride) : "memory"
+                );
+            }
+            for (int32_t i = quads & 3; i > 0; --i) {
                 __asm__ volatile (
                     "ee.vst.128.xp q0, %[p], %[s]\n\t"
                     : [p] "+r"(out) : [s] "r"(stride) : "memory"
@@ -333,9 +345,9 @@ namespace Renderer
     }
 
     bool PERF_CRITICAL Rasterizer::drawTriangle(
-        const Object::Vertex &v1,
-        const Object::Vertex &v2,
-        const Object::Vertex &v3,
+        const RenderVertex &v1,
+        const RenderVertex &v2,
+        const RenderVertex &v3,
         Material *material,
         DirectionalLight *directionalLight,
         AmbientLight *ambientLight,
@@ -344,7 +356,8 @@ namespace Renderer
         bool noWriteZBuffer,
         int zBias,
         uint8_t objAlpha,
-        bool brightnessPrecomputed)
+        bool brightnessPrecomputed,
+        int32_t avgZHint)
     {
         // Fold per-object fade alpha into the material alpha up front so
         // every downstream alpha decision (early-out, depth fog, stipple
@@ -359,6 +372,8 @@ namespace Renderer
         {
             return false;
         }
+
+        (void)avgZHint; // Only consumed on the FAST_Z && !LAZY_Z path.
 
 #if TEXTURE_MAPPING
         Texture *diffuseMap = material->diffuseMap;
@@ -413,14 +428,30 @@ namespace Renderer
 
 #if FAST_Z
 #if LAZY_Z
+        // LAZY_Z needs the max Z, not the average — the caller's avgZ hint
+        // doesn't apply here.
         int32_t z = std::max({v1.position.z, v2.position.z, v3.position.z});
-#else
-        int32_t z = (v1.position.z + v2.position.z + v3.position.z) / 3;
-#endif
         if (z < nearPlane || z > farPlane)
         {
             return false;
         }
+#else
+        int32_t z;
+        if (avgZHint != INT32_MIN)
+        {
+            // Scene::emitTri computed this exact average at queue time and
+            // already culled against near/far — trust it and skip both.
+            z = avgZHint;
+        }
+        else
+        {
+            z = (v1.position.z + v2.position.z + v3.position.z) / 3;
+            if (z < nearPlane || z > farPlane)
+            {
+                return false;
+            }
+        }
+#endif
         #if Z_BUFFERING
         // Z buffer stores raw int32_t z, narrowed to uint16_t. The project's
         // farPlane (~4096) fits comfortably; we clamp to UINT16_MAX so any
@@ -494,7 +525,7 @@ namespace Renderer
                 }
                 else
                 {
-                    const Object::Vertex* verts[3] = { &v1, &v2, &v3 };
+                    const RenderVertex* verts[3] = { &v1, &v2, &v3 };
                     for (int i = 0; i < 3; i++)
                     {
                         vertexBrightness[i] = jetShadeBrightness(
@@ -720,13 +751,18 @@ namespace Renderer
         int32_t oneOverZ2 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v2.position.z;
         int32_t oneOverZ3 = (FIXED_POINT_SCALE * FIXED_POINT_SCALE) / v3.position.z;
 
-        // Precompute u_over_z and v_over_z at each vertex
+#if TEXTURE_MAPPING
+        // Precompute u_over_z and v_over_z at each vertex. Only with
+        // TEXTURE_MAPPING: RenderVertex carries uv only in textured builds.
+        // (PERSPECTIVE_CORRECT_TEXTURES without TEXTURE_MAPPING is still a
+        // valid config — it drives perspective-correct PHONG normals.)
         int32_t uOverZ1 = (v1.uv.x * oneOverZ1) / FIXED_POINT_SCALE;
         int32_t vOverZ1 = (v1.uv.y * oneOverZ1) / FIXED_POINT_SCALE;
         int32_t uOverZ2 = (v2.uv.x * oneOverZ2) / FIXED_POINT_SCALE;
         int32_t vOverZ2 = (v2.uv.y * oneOverZ2) / FIXED_POINT_SCALE;
         int32_t uOverZ3 = (v3.uv.x * oneOverZ3) / FIXED_POINT_SCALE;
         int32_t vOverZ3 = (v3.uv.y * oneOverZ3) / FIXED_POINT_SCALE;
+#endif // TEXTURE_MAPPING
 
 #if LIGHTING
         // Precompute normal_component / z at each vertex so Phong shading
@@ -1033,7 +1069,16 @@ namespace Renderer
                 // across resolutions: 28 → 28 px on 800p desktop,
                 // 28 → ~8 px on 240p ESP32.
                 const int amp    = (int)material->specular * screenHeight / 2400; // /3 of original
-                const int angle  = ((y * 5 + (int)(waterTime * 240.0f)) % 360 + 360) % 360;
+                // Perspective-correct wave density: waves should appear compressed
+                // (denser) near the horizon where geometry is far away, and stretched
+                // (sparser) near the camera.  (screenHeight - y) is large at the top of
+                // the screen (horizon side) and approaches 0 at the very bottom (camera
+                // side), so squaring it produces the right quadratic phase accumulation —
+                // many wave cycles near the waterline, fewer toward the viewer.
+                // Cost: one extra multiply and a divide versus the old linear y*5.
+                const int perspY = screenHeight - y;
+                const int angle  = ((perspY * perspY * 20 / screenHeight + (int)(waterTime * 240.0f)) % 360 + 360) % 360;
+                //const int angle = ((y * 5 + (int)(waterTime * 240.0f)) % 360 + 360) % 360; //MB: This version doesn't take perspective into account, so waves look the same near and far, which is less realistic but more performant.
                 const int ripple = (lookupSinI(angle) * amp) >> 10; // Q10 → pixels
                 // Use the camera-pitch-correct waterline as the mirror axis:
                 // mirrorY = 2*waterlineY - y gives geometrically accurate

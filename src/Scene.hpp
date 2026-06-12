@@ -191,7 +191,7 @@ public:
 
 private:
     struct RenderTri {
-        Object::Vertex v1, v2, v3;
+        RenderVertex v1, v2, v3;
         Material* material;
         int32_t avgZ;
         bool ignoreZBuffer;
@@ -214,6 +214,11 @@ private:
 #endif
     };
     std::vector<RenderTri> renderQueue;
+    // Painter's-sort output as indices into renderQueue, rebuilt by
+    // prepareFrame() each frame. Sorting (scattering) 4-byte indices
+    // instead of whole RenderTri structs avoids a full second copy of the
+    // queue per frame; rasterizeBand() walks this to draw in depth order.
+    std::vector<int32_t> renderOrder;
 
     Camera* camera;
     DirectionalLight* directionalLight;
@@ -235,6 +240,13 @@ private:
     uint16_t backcolor = 0;
     bool clearRenderBuffer = true;
     bool renderEvenLines = false;
+
+    // Frustum side-plane normal lengths for the quick sphere cull in
+    // cullObject(): |(fovFactor, ±screenW/2)| and |(fovFactor, ±screenH/2)|.
+    // Recomputed once per frame in prepareFrame() because fovFactor
+    // changes at runtime (boost FOV kick).
+    float cullPlaneLh = 1.0f;
+    float cullPlaneLv = 1.0f;
 
     bool cullObject(Object* obj,
                     int32_t camCosX, int32_t camSinX,

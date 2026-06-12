@@ -342,11 +342,10 @@ public:
 
             // v0 = tip (velocity direction), v1/v2 = base ± perp.
             // noWriteZ so sparks don't occlude each other or later geometry.
-            Object::Vertex v0, v1, v2;
+            RenderVertex v0, v1, v2;
             v0.position = { tx,         ty,         tcZ  };
             v1.position = { bx + perpX, by + perpY, camZ };
             v2.position = { bx - perpX, by - perpY, camZ };
-            v0.color = v1.color = v2.color = mat.color;
 
             raster->drawTriangle(v0, v1, v2, &mat,
                                  nullptr, nullptr,

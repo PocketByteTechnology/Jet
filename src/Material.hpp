@@ -38,7 +38,7 @@ public:
                                 ///<   biasing the reflection axis upward to align with the true
                                 ///<   waterline. Stored in device-native pixels (no resolution scaling).
                                 ///<   Set via WaterSurface::setReflectionMode(alpha, rippleAmp, yBias).
-    ShadingMode shadingMode = ShadingMode::GOURAUD; ///< Shading model.
+    ShadingMode shadingMode = ShadingMode::FLAT; ///< Shading model.
     char* name;                 ///< Optional name; used for `usemtl` matching in OBJ loading.
 
     /// @brief Construct a material.

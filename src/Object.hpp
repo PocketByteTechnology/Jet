@@ -9,6 +9,9 @@
 
 namespace Renderer {
 
+class DirectionalLight;
+class AmbientLight;
+
 /// @brief Triangle culling mode for an Object.
 enum class CullingMode {
     CULL_BACKFACES,     ///< Cull triangles facing away from the camera.
@@ -33,6 +36,11 @@ public:
     struct Triangle {
         uint16_t v1, v2, v3;        ///< Vertex indices.
         Material* material;         ///< Material applied to this face.
+        /// @brief Pre-lit RGB565 colour baked by bakeFlatLighting().
+        /// When `colorBaked` is true this overrides material->color and
+        /// bypasses all per-frame lighting computation for this face.
+        uint16_t bakedColor  = 0;
+        bool     colorBaked  = false;
     };
 
     /// @brief Single mesh vertex.
@@ -239,6 +247,23 @@ public:
     /// @param numerator Scale numerator.
     /// @param denominator Scale denominator (must be non-zero).
     void bakeScale(int32_t numerator, int32_t denominator);
+
+    /// @brief Pre-compute FLAT shading into each triangle's `bakedColor` field
+    ///        so that subsequent render() calls cost nothing for lighting.
+    ///
+    /// Only triangles whose material uses `ShadingMode::FLAT` (or UNLIT/GOURAUD
+    /// when `forceFlat` is true) are processed; others are skipped.
+    /// The original material pointers are preserved unchanged — baking does
+    /// not allocate any new Material objects.
+    ///
+    /// After calling this, set `LIGHTING=0` in JetConfig and the scene will
+    /// render at full no-lighting speed while still looking correctly lit.
+    /// If the light or ambient colour changes, call this again to rebuild.
+    ///
+    /// @param directionalLight  Directional light to bake from (may be nullptr).
+    /// @param ambientLight      Ambient light to bake from (may be nullptr).
+    void bakeFlatLighting(const DirectionalLight* directionalLight,
+                          const AmbientLight*     ambientLight);
 private:
 
 };

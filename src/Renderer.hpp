@@ -24,6 +24,32 @@
 
 namespace Renderer
 {
+/// @brief Slim render-time vertex flowing through the transform → queue →
+/// rasterise pipeline.
+///
+/// `Object::Vertex` is the authoring type: game/mesh code always has uv,
+/// normal, etc. available regardless of build configuration. RenderVertex
+/// is what the per-frame pipeline copies around (Scene's transformed-vertex
+/// scratch, the render queue, the painter's sort) — so it only carries the
+/// fields the configured pipeline actually consumes. With TEXTURE_MAPPING
+/// and LIGHTING both off this is just 12 bytes of position instead of 36,
+/// which roughly 3×'s the per-triangle queue/sort copy traffic savings.
+///
+/// `position` is screen-space x/y with camera-space z after projection.
+struct RenderVertex {
+    Vector3 position = {0, 0, 0};
+#if TEXTURE_MAPPING
+    Vector2 uv = {0, 0};            ///< Texture coordinates.
+#endif
+#if LIGHTING
+    Vector3 normal = {0, 0, 0};     ///< View-space (or mesh-local, see lambertBrightness) normal.
+    /// @brief Precomputed Lambert brightness for the object-local-light
+    /// path (see Scene.cpp "objectLocalLight"). Only meaningful when the
+    /// triangle was queued with brightnessPrecomputed == true.
+    uint16_t lambertBrightness = 0;
+#endif
+};
+
 /// @brief Low-level triangle rasteriser owning a colour and depth buffer.
 ///
 /// Scene drives this class on every render(). External users normally
@@ -145,8 +171,15 @@ class Rasterizer
         /// @param noWriteZBuffer Skip the depth write when true.
         /// @param zBias Per-triangle depth bias in z-buffer units.
         /// @param objAlpha Per-object alpha multiplier (255 = no fade).
+        /// @param brightnessPrecomputed v1/v2/v3.lambertBrightness already holds per-vertex brightness (object-local-light path).
+        /// @param avgZHint Caller-supplied triangle average camera-space Z, or
+        ///        INT32_MIN (default) to compute it here. Scene::rasterizeBand
+        ///        passes the avgZ it already computed (and near/far-culled
+        ///        against) at queue time, so the FAST_Z setup can skip the
+        ///        recompute and the redundant near/far test. Ignored when
+        ///        LAZY_Z is enabled (LAZY_Z needs the max, not the average).
         /// @return True if the triangle produced any rasterizer work.
-        bool drawTriangle(const Object::Vertex &v1, const Object::Vertex &v2, const Object::Vertex &v3, Material *material, DirectionalLight *directionalLight, AmbientLight *ambientLight, bool renderEvenLines, bool ignoreZBuffer, bool noWriteZBuffer, int zBias, uint8_t objAlpha = 255, bool brightnessPrecomputed = false);
+        bool drawTriangle(const RenderVertex &v1, const RenderVertex &v2, const RenderVertex &v3, Material *material, DirectionalLight *directionalLight, AmbientLight *ambientLight, bool renderEvenLines, bool ignoreZBuffer, bool noWriteZBuffer, int zBias, uint8_t objAlpha = 255, bool brightnessPrecomputed = false, int32_t avgZHint = INT32_MIN);
 
         /// @brief Map an 8-bit grayscale value to RGB565.
         /// @param grayscale 8-bit luminance.
